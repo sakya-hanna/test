@@ -27,6 +27,9 @@ const routes = [
   { path: '/notifications', name: 'Notifications', component: () => import('../views/Notifications.vue') },
   { path: '/notifications/:id', name: 'NotificationDetail', component: () => import('../views/NotificationDetail.vue') },
 
+  // 测试页面
+  { path: '/test-demo', name: 'TestDemo', component: () => import('../views/TestDemo.vue') },
+
   // 兜底
   { path: '/', redirect: '/login' },
   { path: '/:pathMatch(.*)*', name: 'NotFound', component: () => import('../views/NotFound.vue') },
