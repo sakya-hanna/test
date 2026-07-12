@@ -11,7 +11,7 @@ const count = ref(0)
       自动部署成功 - {{ new Date().toLocaleString('zh-CN') }}
     </p>
     <button @click="count++" style="padding:12px 32px;font-size:18px;border-radius:8px;cursor:pointer;">
-      Count: {{ count }}
+      Auto Deployed! Count: {{ count }}
     </button>
   </div>
 </template>
