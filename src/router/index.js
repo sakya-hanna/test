@@ -29,6 +29,7 @@ const routes = [
 
   // 测试页面
   { path: '/test-demo', name: 'TestDemo', component: () => import('../views/TestDemo.vue') },
+  { path: '/hello', name: 'HelloWorld', component: () => import('../views/HelloWorld.vue') },
 
   // 兜底
   { path: '/', redirect: '/login' },
