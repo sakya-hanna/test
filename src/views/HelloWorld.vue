@@ -33,7 +33,7 @@ async function callBackend() {
   loading.value = true
   result.value = null
   try {
-    const res = await fetch('http://106.14.139.17:8080/api/ping', { method: 'POST' })
+    const res = await fetch('/api/ping', { method: 'POST' })
     result.value = await res.json()
   } catch (e) {
     result.value = { error: e.message }
