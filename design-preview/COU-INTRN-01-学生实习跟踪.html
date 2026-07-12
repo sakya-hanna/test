@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1440">
+<title>COU-INTRN-01 学生实习跟踪 - 设计原型</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif; background: #e5e7eb; display: flex; justify-content: center; }
+.page { width: 1440px; height: 1024px; display: flex; }
+/* 侧边栏 */
+.sidebar { width: 232px; background: #00203D; color: #fff; flex-shrink: 0; display: flex; flex-direction: column; }
+.sidebar-logo { padding: 20px; border-bottom: 1px solid rgba(255,255,255,0.1); font-size: 18px; font-weight: 600; }
+.sidebar-nav { flex: 1; padding: 12px; }
+.nav-item { display: flex; align-items: center; padding: 12px 16px; border-radius: 8px; font-size: 16px; cursor: pointer; transition: background 0.15s; color: rgba(255,255,255,0.8); }
+.nav-item:hover { background: rgba(255,255,255,0.06); }
+.nav-item.active { color: #C7D2FE; }
+.nav-item.icon { gap: 10px; }
+.nav-sub { margin-left: 24px; margin-top: 2px; }
+.nav-sub a { display: block; padding: 4px 8px; font-size: 16px; color: rgba(255,255,255,0.8); text-decoration: none; border-radius: 4px; transition: background 0.15s; }
+.nav-sub a:hover { background: rgba(255,255,255,0.06); }
+.nav-sub a.active { color: #C7D2FE; }
+/* 主区域 */
+.main { flex: 1; display: flex; flex-direction: column; background: #F5F7FB; }
+/* 顶栏 */
+.topbar { height: 72px; background: #fff; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; flex-shrink: 0; }
+.breadcrumb { font-size: 14px; color: #757575; }
+.user-area { display: flex; align-items: center; gap: 12px; }
+.avatar { width: 40px; height: 40px; border-radius: 50%; background: #C8C8C8; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 500; color: #6B7280; }
+.user-name { font-size: 14px; font-weight: 500; color: #111827; }
+.user-role { font-size: 12px; color: #2563EB; }
+.logout { font-size: 14px; font-weight: 500; color: #FF383C; cursor: pointer; margin-left: 8px; text-decoration: none; }
+.logout:hover { text-decoration: underline; }
+/* 内容 */
+.content { flex: 1; overflow: auto; padding: 24px 40px; }
+.page-header { margin-bottom: 20px; }
+.page-breadcrumb { font-size: 14px; color: #757575; }
+.page-title { font-size: 32px; font-weight: 700; color: #111827; margin-top: 4px; }
+.page-subtitle { font-size: 16px; color: #757575; margin-top: 4px; }
+/* 统计卡片 */
+.stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+.stat-card { background: #fff; border-radius: 12px; padding: 20px; }
+.stat-label { font-size: 13px; color: #6B7280; margin-bottom: 8px; }
+.stat-value { font-size: 28px; font-weight: 700; }
+.stat-value.blue { color: #2563EB; }
+.stat-value.green { color: #16A34A; }
+.stat-value.red { color: #FF383C; }
+.stat-value.orange { color: #D97706; }
+/* 工具栏 */
+.toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.filter-group { display: flex; align-items: center; gap: 12px; }
+.filter-label { font-size: 14px; font-weight: 500; color: #111827; }
+.filter-tab { font-size: 14px; cursor: pointer; color: #6B7280; padding: 4px 8px; border-radius: 4px; transition: all 0.15s; }
+.filter-tab:hover { color: #2563EB; }
+.filter-tab.active { color: #2563EB; font-weight: 600; }
+.search-box { width: 260px; height: 36px; border: 1px solid rgba(0,0,0,0.16); border-radius: 8px; padding: 0 12px; font-size: 14px; color: #9CA3AF; background: #fff; outline: none; }
+.search-box:focus { border-color: #2563EB; }
+/* 表格 */
+.table-wrap { background: #fff; border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+.table-header { height: 44px; display: flex; align-items: center; padding: 0 16px; background: #F3F4F6; }
+.th { font-size: 12px; font-weight: 600; color: #374151; flex-shrink: 0; }
+.th-check { width: 36px; }
+.th-name { width: 80px; }
+.th-sid { width: 100px; }
+.th-cls { width: 100px; }
+.th-company { width: 160px; }
+.th-type { width: 120px; }
+.th-progress { width: 120px; }
+.th-last { width: 120px; }
+.th-status { width: 80px; }
+.th-action { width: 60px; }
+.table-row { height: 52px; display: flex; align-items: center; padding: 0 16px; border-bottom: 1px solid #E5E7EB; transition: background 0.15s; }
+.table-row:hover { background: #F9FAFB; }
+.table-row:last-child { border-bottom: none; }
+.td { font-size: 12px; color: #374151; flex-shrink: 0; }
+.checkbox { width: 16px; height: 16px; border: 1.5px solid rgba(0,0,0,0.25); border-radius: 4px; cursor: pointer; }
+.checkbox.checked { background: #2563EB; border-color: #2563EB; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 10px; }
+.status-tag { display: inline-flex; align-items: center; padding: 2px 12px; border-radius: 12px; font-size: 11px; font-weight: 500; }
+.action-link { font-size: 13px; font-weight: 500; cursor: pointer; text-decoration: none; }
+.action-link:hover { text-decoration: underline; }
+.action-link.blue { color: #2563EB; }
+.action-link.red { color: #FF383C; }
+/* 分页 */
+.pagination { height: 44px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; background: #fff; border-radius: 8px; }
+.page-info { font-size: 13px; color: #6B7280; }
+.page-btns { display: flex; align-items: center; gap: 4px; }
+.page-btn { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 6px; font-size: 13px; cursor: pointer; border: 1px solid #E5E7EB; background: #fff; color: #374151; transition: all 0.15s; }
+.page-btn:hover { border-color: #2563EB; color: #2563EB; }
+.page-btn.active { background: #2563EB; color: #fff; border-color: #2563EB; }
+.page-btn.disabled { opacity: 0.4; cursor: not-allowed; }
+/* 弹窗 */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none; align-items: center; justify-content: center; z-index: 100; }
+.modal-overlay.show { display: flex; }
+.modal { width: 560px; background: #fff; border-radius: 12px; overflow: hidden; }
+.modal-header { padding: 20px 24px; border-bottom: 1px solid #E5E7EB; display: flex; align-items: center; justify-content: space-between; }
+.modal-title { font-size: 18px; font-weight: 600; color: #111827; }
+.modal-close { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; cursor: pointer; font-size: 18px; color: #6B7280; border: none; background: none; }
+.modal-close:hover { background: #F3F4F6; color: #111827; }
+.modal-body { padding: 24px; }
+.info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; }
+.info-item { display: flex; gap: 8px; font-size: 13px; }
+.info-label { color: #6B7280; flex-shrink: 0; }
+.info-value { color: #111827; }
+.timeline { margin-top: 20px; padding-top: 16px; border-top: 1px solid #E5E7EB; }
+.timeline-title { font-size: 14px; font-weight: 600; color: #111827; margin-bottom: 12px; }
+.timeline-node { display: flex; gap: 12px; padding: 8px 0; position: relative; }
+.timeline-node::before { content: ''; position: absolute; left: 7px; top: 28px; bottom: -8px; width: 2px; background: #E5E7EB; }
+.timeline-node:last-child::before { display: none; }
+.timeline-dot { width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0; margin-top: 2px; }
+.timeline-dot.done { background: #16A34A; }
+.timeline-dot.current { background: #2563EB; }
+.timeline-dot.pending { background: #E5E7EB; border: 2px solid #D1D5DB; }
+.timeline-dot.warning { background: #FF383C; }
+.timeline-content { flex: 1; }
+.timeline-label { font-size: 13px; color: #111827; font-weight: 500; }
+.timeline-date { font-size: 11px; color: #9CA3AF; }
+.modal-footer { padding: 16px 24px; border-top: 1px solid #E5E7EB; display: flex; justify-content: flex-end; gap: 8px; }
+.btn { height: 36px; padding: 0 18px; border-radius: 6px; font-size: 14px; cursor: pointer; transition: all 0.15s; display: flex; align-items: center; gap: 4px; }
+.btn-primary { background: #2563EB; color: #fff; border: none; }
+.btn-primary:hover { background: #1D4ED8; }
+.btn-outline { background: #fff; color: #374151; border: 1px solid #D1D5DB; }
+.btn-outline:hover { border-color: #2563EB; color: #2563EB; }
+.btn-danger { background: #fff; color: #FF383C; border: 1px solid #FF383C; }
+.btn-danger:hover { background: #FF383C; color: #fff; }
+.toast { position: fixed; top: 24px; left: 50%; transform: translateX(-50%); background: #16A34A; color: #fff; padding: 10px 24px; border-radius: 8px; font-size: 14px; z-index: 9999; display: none; box-shadow: 0 4px 16px rgba(0,0,0,0.2); }
+.toast.show { display: block; animation: slideDown 0.3s ease; }
+@keyframes slideDown { from { opacity: 0; transform: translateX(-50%) translateY(-10px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+.badge { position: fixed; top: 8px; right: 16px; background: #2563EB; color: #fff; padding: 4px 12px; border-radius: 4px; font-size: 12px; z-index: 9999; }
+</style>
+</head>
+<body>
+
+<div class="badge">🎨 COU-INTRN-01 学生实习跟踪</div>
+<div class="toast" id="toast"></div>
+
+<div class="page">
+  <!-- 侧边栏 — 与 Dashboard 完全一致 -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">实习管理系统</div>
+    <nav class="sidebar-nav">
+      <a href="cou-dashboard.html" class="nav-item" style="color:rgba(255,255,255,0.8);">指导工作台</a>
+      <div>
+        <a href="#" class="nav-item active">我的学生</a>
+        <div class="nav-sub">
+          <a href="#" style="color:rgba(255,255,255,0.8);">学生列表</a>
+          <a href="#" class="active">学生实习跟踪</a>
+          <a href="cou-alerts.html" style="color:rgba(255,255,255,0.8);">安全提醒沟通</a>
+          <a href="#" style="color:rgba(255,255,255,0.8);">家长知情确认</a>
+        </div>
+      </div>
+      <a href="#" class="nav-item">过程反馈</a>
+      <a href="#" class="nav-item">学生评价</a>
+      <a href="cou-notifications.html" class="nav-item">通知公告</a>
+    </nav>
+  </aside>
+
+  <!-- 主区域 -->
+  <div class="main">
+    <!-- 顶栏 -->
+    <header class="topbar">
+      <span class="breadcrumb">我的学生 / 学生实习跟踪</span>
+      <div class="user-area">
+        <div class="avatar">孙</div>
+        <div>
+          <div class="user-name">孙辅导员</div>
+          <div class="user-role">辅导员</div>
+        </div>
+        <a href="#" class="logout" onclick="showToast('已安全退出登录')">登出</a>
+      </div>
+    </header>
+
+    <!-- 内容区 -->
+    <main class="content">
+      <!-- 页面标题 -->
+      <div class="page-header">
+        <div class="page-breadcrumb">我的学生 / 学生实习跟踪</div>
+        <h1 class="page-title">学生实习跟踪</h1>
+        <p class="page-subtitle">按学生查看实习进度详情，及时发现并处理异常情况</p>
+      </div>
+
+      <!-- 统计卡片 -->
+      <div class="stats-row">
+        <div class="stat-card" onclick="showToast('筛选：全部学生 156人')" style="cursor:pointer;">
+          <div class="stat-label">全部学生</div>
+          <div class="stat-value blue">156</div>
+        </div>
+        <div class="stat-card" onclick="filterTable('正常')" style="cursor:pointer;">
+          <div class="stat-label">正常实习</div>
+          <div class="stat-value green">128</div>
+        </div>
+        <div class="stat-card" onclick="filterTable('异常')" style="cursor:pointer;">
+          <div class="stat-label">异常预警</div>
+          <div class="stat-value red">8</div>
+        </div>
+        <div class="stat-card" onclick="filterTable('未提交')" style="cursor:pointer;">
+          <div class="stat-label">待沟通</div>
+          <div class="stat-value orange">3</div>
+        </div>
+      </div>
+
+      <!-- 筛选工具栏 -->
+      <div class="toolbar">
+        <div class="filter-group">
+          <span class="filter-label">筛选：</span>
+          <span class="filter-tab active" onclick="filterTable('全部', this)">全部</span>
+          <span class="filter-tab" onclick="filterTable('正常', this)">正常</span>
+          <span class="filter-tab" onclick="filterTable('异常', this)">异常</span>
+          <span class="filter-tab" onclick="filterTable('未提交', this)">未提交周报</span>
+        </div>
+        <input type="text" class="search-box" placeholder="搜索学生姓名或学号..." oninput="searchTable(this.value)">
+      </div>
+
+      <!-- 数据表格 -->
+      <div class="table-wrap">
+        <div class="table-header">
+          <div class="th th-check"></div>
+          <div class="th th-name">学生姓名</div>
+          <div class="th th-sid">学号</div>
+          <div class="th th-cls">班级</div>
+          <div class="th th-company">实习企业</div>
+          <div class="th th-type">实习类型</div>
+          <div class="th th-progress">周报进度</div>
+          <div class="th th-last">最近提交</div>
+          <div class="th th-status">状态</div>
+          <div class="th th-action">操作</div>
+        </div>
+        <div id="tableBody">
+          <!-- JS动态填充 -->
+        </div>
+      </div>
+
+      <!-- 分页 -->
+      <div class="pagination">
+        <span class="page-info" id="pageInfo">共 6 名学生</span>
+        <div class="page-btns">
+          <button class="page-btn disabled" onclick="changePage('prev')">«</button>
+          <button class="page-btn active" onclick="changePage(1)">1</button>
+          <button class="page-btn disabled" onclick="changePage('next')">»</button>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 学生详情弹窗 -->
+<div class="modal-overlay" id="detailModal">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle">学生详情 - 李明</span>
+      <button class="modal-close" onclick="closeDetail()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="info-grid" id="modalInfo">
+        <!-- JS动态填充 -->
+      </div>
+      <div class="timeline">
+        <div class="timeline-title">实习里程碑</div>
+        <div class="timeline-node">
+          <div class="timeline-dot done"></div>
+          <div class="timeline-content">
+            <div class="timeline-label">实习申请提交</div>
+            <div class="timeline-date">2026-02-15</div>
+          </div>
+        </div>
+        <div class="timeline-node">
+          <div class="timeline-dot done"></div>
+          <div class="timeline-content">
+            <div class="timeline-label">教师审核通过</div>
+            <div class="timeline-date">2026-02-18</div>
+          </div>
+        </div>
+        <div class="timeline-node">
+          <div class="timeline-dot done"></div>
+          <div class="timeline-content">
+            <div class="timeline-label">学院复核通过</div>
+            <div class="timeline-date">2026-02-20</div>
+          </div>
+        </div>
+        <div class="timeline-node">
+          <div class="timeline-dot done"></div>
+          <div class="timeline-content">
+            <div class="timeline-label">实习开始</div>
+            <div class="timeline-date">2026-03-01</div>
+          </div>
+        </div>
+        <div class="timeline-node">
+          <div class="timeline-dot current"></div>
+          <div class="timeline-content">
+            <div class="timeline-label">实习进行中</div>
+            <div class="timeline-date">当前第12周</div>
+          </div>
+        </div>
+        <div class="timeline-node">
+          <div class="timeline-dot pending"></div>
+          <div class="timeline-content">
+            <div class="timeline-label">实习结束</div>
+            <div class="timeline-date">预计 2026-08-31</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-danger" onclick="sendReminder()">📩 发送提醒</button>
+      <button class="btn btn-outline" onclick="closeDetail()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 发送提醒弹窗 -->
+<div class="modal-overlay" id="remindModal">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">发送提醒</span>
+      <button class="modal-close" onclick="closeRemind()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="info-item" style="margin-bottom:16px;">
+        <span class="info-label">发送对象：</span>
+        <span class="info-value" id="remindTarget">李明 - 软件2201</span>
+      </div>
+      <div style="margin-bottom:8px;font-size:13px;color:#6B7280;">提醒渠道：</div>
+      <div style="display:flex;gap:12px;margin-bottom:16px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">
+          <input type="checkbox" checked> 站内信
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">
+          <input type="checkbox" checked> 短信
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">
+          <input type="checkbox"> 微信
+        </label>
+      </div>
+      <div style="margin-bottom:8px;font-size:13px;color:#6B7280;">提醒内容：</div>
+      <textarea style="width:100%;height:100px;border:1px solid #D1D5DB;border-radius:8px;padding:12px;font-size:13px;resize:vertical;outline:none;" id="remindMsg">同学你好，你的实习周报已连续未提交，请尽快登录系统完成提交。如有特殊情况请及时联系辅导员说明。</textarea>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeRemind()">取消</button>
+      <button class="btn btn-primary" onclick="doRemind()">确认发送</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const allStudents = [
+  { id:1, name:'李明', sid:'2024030112', cls:'软件2201', company:'无锡科技有限公司', type:'毕业实习', progress:'3/12', lastSubmit:'03-20 周报', status:'正常', statusBg:'rgba(22,163,74,0.1)', statusColor:'#16A34A', action:'详情', actionColor:'#2563EB' },
+  { id:2, name:'王芳', sid:'2024030115', cls:'软件2202', company:'苏州创新技术公司', type:'企业需求对接', progress:'2/12', lastSubmit:'03-18 月报', status:'正常', statusBg:'rgba(22,163,74,0.1)', statusColor:'#16A34A', action:'详情', actionColor:'#2563EB' },
+  { id:3, name:'赵强', sid:'2024030120', cls:'计算机2201', company:'南京软件有限公司', type:'毕业实习', progress:'1/12', lastSubmit:'03-10 周报', status:'异常', statusBg:'rgba(255,56,60,0.1)', statusColor:'#FF383C', action:'详情', actionColor:'#2563EB' },
+  { id:4, name:'陈雪', sid:'2024030125', cls:'计算机2202', company:'上海数据集团', type:'灵活实习', progress:'0/12', lastSubmit:'未提交', status:'未提交', statusBg:'rgba(217,119,6,0.1)', statusColor:'#D97706', action:'提醒', actionColor:'#FF383C' },
+  { id:5, name:'刘洋', sid:'2024030130', cls:'软件2201', company:'杭州云科技有限公司', type:'认知实习', progress:'4/4', lastSubmit:'03-15 报告', status:'已完成', statusBg:'rgba(107,114,128,0.1)', statusColor:'#6B7280', action:'详情', actionColor:'#2563EB' },
+  { id:6, name:'周婷', sid:'2024030135', cls:'计算机2201', company:'常州智能装备公司', type:'毕业实习', progress:'3/12', lastSubmit:'03-17 周报', status:'正常', statusBg:'rgba(22,163,74,0.1)', statusColor:'#16A34A', action:'详情', actionColor:'#2563EB' },
+];
+
+let currentFilter = '全部';
+let currentSearch = '';
+let remindStudentId = null;
+
+function renderTable() {
+  const filtered = allStudents.filter(s => {
+    const matchFilter = currentFilter === '全部' ? true :
+      currentFilter === '正常' ? s.status === '正常' || s.status === '已完成' :
+      currentFilter === '异常' ? s.status === '异常' :
+      currentFilter === '未提交' ? s.status === '未提交' : true;
+    const matchSearch = !currentSearch ||
+      s.name.includes(currentSearch) || s.sid.includes(currentSearch);
+    return matchFilter && matchSearch;
+  });
+
+  const tbody = document.getElementById('tableBody');
+  tbody.innerHTML = filtered.map((s, i) => `
+    <div class="table-row">
+      <div class="td th-check"><div class="checkbox" onclick="this.classList.toggle('checked');this.innerHTML=this.classList.contains('checked')?'✓':'';"></div></div>
+      <div class="td th-name">${s.name}</div>
+      <div class="td th-sid">${s.sid}</div>
+      <div class="td th-cls">${s.cls}</div>
+      <div class="td th-company">${s.company}</div>
+      <div class="td th-type">${s.type}</div>
+      <div class="td th-progress">${s.progress}</div>
+      <div class="td th-last">${s.lastSubmit}</div>
+      <div class="td th-status">
+        <span class="status-tag" style="background:${s.statusBg};color:${s.statusColor}">${s.status}</span>
+      </div>
+      <div class="td th-action">
+        <a href="#" class="action-link blue" onclick="openDetail(${s.id}, event)">详情</a>
+      </div>
+    </div>
+  `).join('');
+
+  document.getElementById('pageInfo').textContent = `共 ${filtered.length} 名学生`;
+}
+
+function filterTable(filter, el) {
+  currentFilter = filter;
+  document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+  if (el) el.classList.add('active');
+  renderTable();
+}
+
+function searchTable(val) {
+  currentSearch = val;
+  renderTable();
+}
+
+function changePage(action) {
+  showToast('当前仅一页数据');
+}
+
+function openDetail(id, e) {
+  e.preventDefault();
+  const s = allStudents.find(x => x.id === id);
+  document.getElementById('modalTitle').textContent = '学生详情 - ' + s.name;
+  document.getElementById('modalInfo').innerHTML = `
+    <div class="info-item"><span class="info-label">姓名：</span><span class="info-value">${s.name}</span></div>
+    <div class="info-item"><span class="info-label">学号：</span><span class="info-value">${s.sid}</span></div>
+    <div class="info-item"><span class="info-label">班级：</span><span class="info-value">${s.cls}</span></div>
+    <div class="info-item"><span class="info-label">实习类型：</span><span class="info-value">${s.type}</span></div>
+    <div class="info-item"><span class="info-label">实习企业：</span><span class="info-value">${s.company}</span></div>
+    <div class="info-item"><span class="info-label">周报进度：</span><span class="info-value">${s.progress}</span></div>
+    <div class="info-item"><span class="info-label">最近提交：</span><span class="info-value">${s.lastSubmit}</span></div>
+    <div class="info-item"><span class="info-label">状态：</span><span class="info-value" style="color:${s.statusColor};">${s.status}</span></div>
+  `;
+  document.getElementById('detailModal').classList.add('show');
+  remindStudentId = id;
+}
+
+function closeDetail() {
+  document.getElementById('detailModal').classList.remove('show');
+}
+
+function sendReminder() {
+  closeDetail();
+  const s = allStudents.find(x => x.id === remindStudentId);
+  document.getElementById('remindTarget').textContent = s.name + ' - ' + s.cls;
+  document.getElementById('remindModal').classList.add('show');
+}
+
+function closeRemind() {
+  document.getElementById('remindModal').classList.remove('show');
+}
+
+function doRemind() {
+  closeRemind();
+  showToast('✅ 提醒已发送给 ' + allStudents.find(x => x.id === remindStudentId).name);
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+// 初始化
+renderTable();
+</script>
+</body>
+</html>
