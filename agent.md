@@ -120,7 +120,7 @@ const groups = {};
 for (const node of allLooseNodes) {
     let key = '_other';
     if (isInSet(node, ["面包屑", "页面标题", "副标题"])) key = '头部标题组';
-    else if (isInSet(node, ["用户名", "角色标签", ...])) key = '用户信息组';
+    else if (isInSet(node, ["用户名", "角色标签", ...应为表达式])) key = '用户信息组';
     // ... more classification ...
     else key = '数据表格组';
     if (!groups[key]) groups[key] = [];
