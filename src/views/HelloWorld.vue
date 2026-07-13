@@ -7,6 +7,7 @@
     <div v-if="result" class="result">
       <pre>{{ JSON.stringify(result, null, 2) }}</pre>
     </div>
+    <router-link to="/goodbye" class="link">Go to Goodbye Page</router-link>
   </div>
 </template>
 
@@ -62,4 +63,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   color: #a0a0b0;
 }
 pre { color: #00ff88; margin: 0; }
+.link {
+  color: #e94560;
+  text-decoration: none;
+  font-size: 14px;
+}
 </style>
