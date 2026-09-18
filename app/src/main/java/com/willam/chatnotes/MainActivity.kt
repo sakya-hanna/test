@@ -113,7 +113,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.tabChat).setOnClickListener { switchTab(true) }
         findViewById<View>(R.id.tabNotes).setOnClickListener { switchTab(false); render() }
         findViewById<View>(R.id.settingsBtn).setOnClickListener { showMenu() }
-        captureInfo.setOnClickListener { if (webViewDestroyed) showRendererRecovery() else showConversations() }
+        captureInfo.setOnClickListener { if (webViewDestroyed) showRendererRecovery() }
         searchInput.addTextChangedListener(object : android.text.TextWatcher {
             override fun afterTextChanged(s: android.text.Editable?) {
                 renderGeneration++; renderLimit = 200
@@ -257,7 +257,7 @@ class MainActivity : AppCompatActivity() {
             val id = selectedId
             disk({ if (id.isEmpty()) 0 else graph.db.count(id) }) { count ->
                 if (id == selectedId) {
-                    captureInfo.text = "$captureState · 已保存 $count 条（点此查看）"
+                    captureInfo.text = "$captureState · 本次已捕获 $count 条消息"
                     captureInfo.setTextColor(if (captureWarning) Color.rgb(170, 80, 0) else Color.rgb(0, 130, 85))
                 }
             }

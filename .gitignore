@@ -37,3 +37,4 @@ captures/
 *.aab
 *.keystore
 !debug.keystore
+config-backup/
