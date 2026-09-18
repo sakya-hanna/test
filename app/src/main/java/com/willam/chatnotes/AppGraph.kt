@@ -10,6 +10,7 @@ class AppGraph private constructor(context: Context) {
     val db = ChatStore(app)
     val notes by lazy { NotesRepo(app) }
     val config = ConfigStore(app)
+    val search by lazy { SearchIndex(app) }
     // Bounded queue: a web page cannot create unlimited pending disk operations.
     val queries = java.util.concurrent.Executors.newSingleThreadExecutor()
     val io = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue<Runnable>(512))

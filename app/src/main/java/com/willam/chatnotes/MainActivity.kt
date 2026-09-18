@@ -26,6 +26,8 @@ import androidx.webkit.WebViewFeature
 import androidx.work.WorkManager
 import io.noties.markwon.Markwon
 import org.json.JSONObject
+import java.util.Locale
+import java.util.Date
 import java.util.concurrent.RejectedExecutionException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -295,7 +297,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
     private fun showMenu() {
-        val actions = arrayOf("LLM 接口设置", "已保存对话", "整理任务与重试", "补采集当前网页", "导出原文与笔记 ZIP")
+        val actions = arrayOf("LLM 接口设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "导出原文与笔记 ZIP")
         AlertDialog.Builder(this).setTitle("ChatNotes").setItems(actions) { _, index ->
             when (index) {
                 0 -> showSettings()
@@ -307,7 +309,14 @@ class MainActivity : AppCompatActivity() {
                     else if (bridgeReady) webView.evaluateJavascript("window.__chatnotes && window.__chatnotes.captureDom()", null)
                     else toast("请先更新 Android System WebView")
                 }
-                4 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
+                4 -> {
+                    toast("正在后台重建索引")
+                    disk({ graph.search.rebuild(graph.notes, graph.db) }) { status ->
+                        toast("索引完成：${status.indexedNotes} 篇笔记、${status.indexedConversations} 个对话${if (status.fts) "" else "（本机不支持 FTS5，已降级为子串匹配）"}")
+                        render()
+                    }
+                }
+                5 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
             }
         }.show()
     }
@@ -410,7 +419,11 @@ class MainActivity : AppCompatActivity() {
                 val child = current.children.firstOrNull { it.isFolder && it.name == name } ?: break
                 actual.add(name); current = child
             }
-            val rows = if (query.isNotEmpty()) graph.notes.search(query) else current.children
+            val rows: List<Pair<Any, String>> = if (query.isNotEmpty()) {
+                // Full-text search across notes AND raw conversations; index synced first.
+                graph.search.ensureIndexed(graph.notes, graph.db)
+                graph.search.query(query).map { it to "" }
+            } else current.children
                 .sortedWith(compareByDescending<NotesRepo.Node> { it.isFolder }.thenByDescending { it.file.lastModified() }).map { it to "" }
             actual to rows
         }) { (actual, rows) ->
@@ -423,25 +436,63 @@ class MainActivity : AppCompatActivity() {
                 })
             }
             if (rows.isEmpty()) listBox.addView(TextView(this).apply {
-                text = if (query.isEmpty()) "暂无笔记。可在菜单中查看已保存对话和整理任务。" else "没有找到匹配笔记"
+                text = if (query.isEmpty()) "暂无笔记。可在菜单中查看已保存对话和整理任务。"
+                else "没有找到匹配的笔记或对话"
                 setPadding(24, 80, 24, 24)
             })
-            rows.take(limit).forEach { (n, path) ->
-                val row = layoutInflater.inflate(R.layout.row_note, listBox, false)
-                row.findViewById<TextView>(R.id.rowTitle).text = n.name
-                row.findViewById<TextView>(R.id.rowSub).text = if (query.isNotEmpty()) path else if (n.isFolder) "分类" else n.date
-                row.setOnClickListener {
-                    if (n.isFolder) { folders.add(n.name); renderLimit = 200; render() }
-                    else disk({ graph.notes.readNote(n.file) }) { markdown ->
-                        markwon.setMarkdown(detailBody, markdown); scrollView.visibility = View.GONE; detailScroll.visibility = View.VISIBLE
+            rows.take(limit).forEach { (item, _) ->
+                when (item) {
+                    is SearchHit -> listBox.addView(searchCard(item))
+                    is NotesRepo.Node -> {
+                        val n = item
+                        val row = layoutInflater.inflate(R.layout.row_note, listBox, false)
+                        row.findViewById<TextView>(R.id.rowTitle).text = n.name
+                        row.findViewById<TextView>(R.id.rowSub).text = if (n.isFolder) "分类" else n.date
+                        row.setOnClickListener {
+                            if (n.isFolder) { folders.add(n.name); renderLimit = 200; render() }
+                            else disk({ graph.notes.readNote(n.file) }) { markdown ->
+                                markwon.setMarkdown(detailBody, markdown); scrollView.visibility = View.GONE; detailScroll.visibility = View.VISIBLE
+                            }
+                        }
+                        listBox.addView(row)
                     }
                 }
-                listBox.addView(row)
             }
             if (rows.size > limit) listBox.addView(Button(this).apply {
                 text = "显示更多（已显示 $limit / ${rows.size}）"; setOnClickListener { renderLimit += 200; render() }
             })
         }
+    }
+
+    /** Result card for one search hit, with keyword highlight and source jump. */
+    private fun searchCard(hit: SearchHit): View {
+        val card = layoutInflater.inflate(R.layout.row_search_hit, listBox, false)
+        val title = card.findViewById<TextView>(R.id.hitTitle)
+        val sub = card.findViewById<TextView>(R.id.hitSnippet)
+        val meta = card.findViewById<TextView>(R.id.hitMeta)
+        title.text = hit.title
+        meta.text = buildString {
+            append(if (hit.kind == "note") "笔记" else "对话")
+            append(" · ")
+            append(java.text.SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(hit.updatedAt)))
+            if (hit.category.isNotBlank() && hit.kind == "note") { append(" · "); append(hit.category) }
+        }
+        val span = android.text.SpannableString(hit.snippet)
+        if (hit.hitEnd > hit.hitStart && hit.hitEnd <= span.length)
+            span.setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD),
+                hit.hitStart, hit.hitEnd, android.text.SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sub.text = span
+        card.setOnClickListener {
+            when (hit.kind) {
+                "note" -> disk({ runCatching { graph.notes.readNote(hit.file) } }) { result ->
+                    result.fold({ markdown ->
+                        markwon.setMarkdown(detailBody, markdown); scrollView.visibility = View.GONE; detailScroll.visibility = View.VISIBLE
+                    }, { toast("笔记文件已被移动或删除，可重建索引") })
+                }
+                "conv" -> showConversation(hit.conversationId)
+            }
+        }
+        return card
     }
     fun onBackFromDetail(view: View) { detailScroll.visibility = View.GONE; scrollView.visibility = View.VISIBLE }
     @Deprecated("Deprecated in Java")
