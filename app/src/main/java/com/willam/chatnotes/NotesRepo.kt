@@ -36,6 +36,20 @@ class NotesRepo(context: Context) {
         fun walk(n: Node) { if (n.isFolder) n.children.forEach { walk(it) } else result.add(n.file) }
         walk(tree()); return result
     }
+    /** All existing category paths (folder chains), for reuse by the summarizer. */
+    fun categoryPaths(): List<List<String>> {
+        val out = mutableListOf<List<String>>()
+        fun walk(n: Node, chain: List<String>) {
+            for (child in n.children) {
+                if (!child.isFolder) continue
+                val next = chain + child.name
+                out.add(next)
+                walk(child, next)
+            }
+        }
+        walk(tree(), emptyList())
+        return out
+    }
     fun search(q: String): List<Pair<Node, String>> = allFiles().mapNotNull { f ->
         if (Thread.currentThread().isInterrupted) throw InterruptedException()
         val n = node(f)

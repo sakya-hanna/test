@@ -34,6 +34,8 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
                     "服务地址已更改，为避免把原文发送到未确认的地址，任务已暂停。请对该会话重新发起总结。"
                 }
                 val api = LlmClient(config.copy(model = inputJson.text("api_model", config.model))).also { client = it }
+                // The model must reuse existing categories instead of inventing near-duplicates.
+                val categories = runCatching { graph.notes.categoryPaths() }.getOrDefault(emptyList())
                 val input = snapshot.messages.joinToString("\n\n") {
                     "[消息 ${it.id}；${it.role}；状态 ${it.status}]\n${it.text}"
                 }
@@ -44,7 +46,7 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
                     // Checkpoint before approaching WorkManager's normal execution time budget.
                     if (callsThisRun >= 3 || System.currentTimeMillis() - started > 210000) throw Paused()
                     callsThisRun++
-                    val partial = api.summarize(content, merge)
+                    val partial = api.summarize(content, merge, categories)
                     db.savePart(id, key, partial.json())
                     return partial
                 }
