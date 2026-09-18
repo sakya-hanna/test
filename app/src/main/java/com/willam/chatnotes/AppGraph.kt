@@ -11,6 +11,14 @@ class AppGraph private constructor(context: Context) {
     val notes by lazy { NotesRepo(app) }
     val config = ConfigStore(app)
     val search by lazy { SearchIndex(app) }
+    /** Embedding API from stored config; null when not configured. */
+    fun embedApi(): EmbedApi? {
+        val base = config.prefs.getString("embed_base_url", "") ?: ""
+        val model = config.prefs.getString("embed_model", "") ?: ""
+        if (base.isBlank() || model.isBlank()) return null
+        val key = runCatching { config.embedApiKey() }.getOrDefault("")
+        return EmbedClient(base, key, model)
+    }
     // Bounded queue: a web page cannot create unlimited pending disk operations.
     val queries = java.util.concurrent.Executors.newSingleThreadExecutor()
     val io = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue<Runnable>(512))

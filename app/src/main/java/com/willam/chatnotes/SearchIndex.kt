@@ -38,6 +38,169 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
     private var schemaReady = false
     @Volatile private var dirty = true
 
+    // ---- vector layer (stage 2) ----
+    data class EmbedStatus(val model: String, val dim: Int, val chunks: Int, val pending: Int, val failed: Int)
+
+    @Synchronized fun ensureEmbedded(
+        notes: NotesRepo, chat: ChatStore, api: EmbedApi,
+        budget: Int = 25, // max embeddings per call (one batch)
+        progress: (Int, Int) -> Unit = { _, _ -> }
+    ): EmbedStatus {
+        ensureIndexed(notes, chat) // documents must be current first
+        val model = api.modelId
+        // Pending chunk rows: added when a document is (re)embedded.
+        val rows = db.rawQuery(
+            "SELECT d.kind,d.id,d.title,d.body FROM documents d " +
+                "LEFT JOIN chunks c ON c.kind=d.kind AND c.doc_id=d.id AND c.model=? " +
+                "WHERE c.kind IS NULL", arrayOf(model)
+        ).use { c ->
+            buildList {
+                while (c.moveToNext()) add(arrayOf(c.getString(0), c.getString(1), c.getString(2), c.getString(3)))
+            }
+        }
+        var done = 0; val total = rows.size
+        var batch = mutableListOf<Triple<String, String, String>>() // kind,id -> chunkText
+        val docChunks = mutableListOf<Pair<Pair<String, String>, String>>()
+        fun flush() {
+            if (batch.isEmpty()) return
+            val vectors = api.embed(batch.map { it.third })
+            require(vectors.size == batch.size) { "向量返回数量不一致" }
+            db.beginTransaction()
+            try {
+                batch.forEachIndexed { i, (kind, id, _) ->
+                    val seq = nextSeq(kind, id, model)
+                    db.execSQL("INSERT OR REPLACE INTO chunks(kind,doc_id,seq,model,dim,vector,input_hash) VALUES(?,?,?,?,?,?,?)",
+                        arrayOf(kind, id, seq, model, vectors[i].size, VectorCodec.encode(vectors[i]),
+                            sha256(docChunks[i].second)))
+                }
+                db.setTransactionSuccessful()
+            } finally { db.endTransaction() }
+            batch = mutableListOf(); docChunks.clear()
+        }
+        for (r in rows) {
+            if (Thread.currentThread().isInterrupted) break
+            val kind = r[0]; val id = r[1]; val title = r[2]; val body = r[3]
+            val parts = Chunker.chunk(title, body)
+            if (parts.isEmpty()) { markEmbeddedEmpty(kind, id, model); continue }
+            for (p in parts) {
+                if (batch.size >= budget) flush()
+                batch.add(Triple(kind, id, p)); docChunks.add((kind to id) to p)
+                if (batch.size >= budget) flush()
+            }
+            done++
+            if (done % 5 == 0) progress(done, total)
+        }
+        flush()
+        return embedStatus(model)
+    }
+
+    private fun nextSeq(kind: String, id: String, model: String): Int =
+        db.rawQuery("SELECT COALESCE(MAX(seq),-1)+1 FROM chunks WHERE kind=? AND doc_id=? AND model=?",
+            arrayOf(kind, id, model)).use { it.moveToFirst(); it.getInt(0) }
+
+    private fun markEmbeddedEmpty(kind: String, id: String, model: String) {
+        db.execSQL("INSERT OR REPLACE INTO chunks(kind,doc_id,seq,model,dim,vector,input_hash) VALUES(?,?,0,?,0,X'','')",
+            arrayOf(kind, id, model))
+    }
+
+    @Synchronized fun embedStatus(model: String): EmbedStatus {
+        ensureSchema()
+        fun count(sql: String, args: Array<String>): Int =
+            db.rawQuery(sql, args).use { it.moveToFirst(); it.getInt(0) }
+        val dim = count("SELECT COUNT(*) FROM chunks WHERE model=? AND dim>0", arrayOf(model)).let {
+            if (it > 0) db.rawQuery("SELECT dim FROM chunks WHERE model=? AND dim>0 LIMIT 1", arrayOf(model))
+                .use { c -> c.moveToFirst(); c.getInt(0) } else 0
+        }
+        val chunks = count("SELECT COUNT(*) FROM chunks WHERE model=? AND dim>0", arrayOf(model))
+        val pending = count(
+            "SELECT COUNT(*) FROM documents d LEFT JOIN chunks c ON c.kind=d.kind AND c.doc_id=d.id AND c.model=? WHERE c.kind IS NULL",
+            arrayOf(model))
+        return EmbedStatus(model, dim, chunks, pending, 0)
+    }
+
+    /** Cosine top-k over stored vectors for one model. Returns (kind,id,score) ranked. */
+    @Synchronized fun vectorSearch(queryVec: FloatArray, model: String, limit: Int = 30): List<Triple<String, String, Float>> {
+        ensureSchema()
+        // Best chunk per document; documents may repeat per chunk, keep max.
+        val best = HashMap<String, Float>()
+        db.rawQuery("SELECT kind,doc_id,vector FROM chunks WHERE model=? AND dim>0", arrayOf(model)).use { c ->
+            while (c.moveToNext()) {
+                val blob = c.getBlob(2) ?: continue
+                if (blob.size / 4 != queryVec.size) continue
+                val score = VectorCodec.cosine(queryVec, VectorCodec.decode(blob))
+                val key = "${c.getString(0)}:${c.getString(1)}"
+                best.merge(key, score) { a, b -> if (a >= b) a else b }
+            }
+        }
+        return best.entries.sortedByDescending { it.value }.take(limit)
+            .map { Triple(it.key.substringBefore(':'), it.key.substringAfter(':'), it.value) }
+    }
+
+    /** Wipe all vectors for a model (model changed / rebuild). */
+    @Synchronized fun clearEmbeddings(model: String) {
+        ensureSchema()
+        db.execSQL("DELETE FROM chunks WHERE model=?", arrayOf(model))
+    }
+
+    /**
+     * Hybrid search: keyword (FTS5/LIKE) and semantic rankings fused with RRF.
+     * Falls back to keyword-only when the API/embedding is unavailable —
+     * offline keyword search must keep working (design requirement).
+     */
+    fun hybridQuery(rawQuery: String, api: EmbedApi?, limit: Int = 100): List<SearchHit> {
+        val keyword = query(rawQuery, limit)
+        if (api == null) return keyword
+        val semantic = runCatching {
+            val vec = api.embed(listOf(rawQuery.trim())).first()
+            vectorSearch(vec, api.modelId)
+        }.getOrDefault(emptyList())
+        if (semantic.isEmpty()) return keyword
+        val keyRank = keyword.map { "${it.kind}:${it.file.absolutePath}:${it.conversationId}" }
+        val semRank = semantic.map { "${it.first}:${it.second}" }
+        val fused = Rrf.fuse(listOf(keyRank, semRank)).take(limit * 2).toMap()
+        // Materialize fused order: keyword hits carry full data; semantic-only
+        // hits are filled from documents.
+        val byKey = HashMap<String, SearchHit>()
+        keyword.forEach { byKey["${it.kind}:${it.file.absolutePath}:${it.conversationId}"] = it }
+        val result = mutableListOf<SearchHit>()
+        for ((key, _) in fused) {
+            val hit = byKey[key] ?: semanticHit(key, rawQuery) ?: continue
+            result.add(hit)
+            if (result.size >= limit) break
+        }
+        // Keyword-only results that fell out of the fusion list still surface.
+        for (h in keyword) {
+            if (result.size >= limit) break
+            val k = "${h.kind}:${h.file.absolutePath}:${h.conversationId}"
+            if (fused.containsKey(k) && byKey.values.none { it === h }) continue
+            if (result.none { it.kind == h.kind && it.file == h.file && it.conversationId == h.conversationId }) result.add(h)
+        }
+        return result
+    }
+
+    /** Raw document lookup used by retrieval-based category injection. */
+    @Synchronized fun rawQueryDocument(kind: String, id: String): Doc? =
+        db.rawQuery("SELECT kind,id,title,category,body,payload,src,updated FROM documents WHERE kind=? AND id=?",
+            arrayOf(kind, id)).use { c ->
+            if (!c.moveToFirst()) null else Doc(c.getString(0), c.getString(1), c.getString(2),
+                c.getString(3), c.getString(4) ?: "", c.getString(5) ?: "", c.getString(6) ?: "", c.getLong(7))
+        }
+
+    private fun semanticHit(key: String, rawQuery: String): SearchHit? {
+        val kind = key.substringBefore(':'); val id = key.substringAfter(':')
+        return db.rawQuery(
+            "SELECT title,category,body,payload,src,updated FROM documents WHERE kind=? AND id=?",
+            arrayOf(kind, id)
+        ).use { c ->
+            if (!c.moveToFirst()) return null
+            val body = c.getString(2) ?: ""
+            val w = SearchLogic.snippets(body, rawQuery).firstOrNull()
+            SearchHit(kind, File(c.getString(3) ?: ""), c.getString(0), c.getString(1), c.getLong(5),
+                w?.first ?: c.getString(0), w?.second ?: 0, w?.third ?: 0, 0,
+                if (kind == "conv") id else (c.getString(4) ?: ""), "", 0)
+        }
+    }
+
     data class Doc(
         val kind: String,        // "note" | "conv"
         val id: String,          // job id / file identity (notes) | conversation id
@@ -71,6 +234,12 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
                 "title_t,body_t,category_t,kind UNINDEXED,id UNINDEXED)")
         }
         db.execSQL("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        // Vector layer: one row per (document, chunk, model). dim=0 marks an
+        // empty/failed marker so the document is not retried forever.
+        db.execSQL("CREATE TABLE IF NOT EXISTS chunks(" +
+            "kind TEXT NOT NULL,doc_id TEXT NOT NULL,seq INTEGER NOT NULL," +
+            "model TEXT NOT NULL,dim INTEGER NOT NULL,vector BLOB NOT NULL," +
+            "input_hash TEXT NOT NULL DEFAULT '',PRIMARY KEY(kind,doc_id,model,seq))")
         schemaReady = true
     }
 
@@ -126,7 +295,8 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
             val name = f.nameWithoutExtension
             val jobId = name.substringAfterLast("--", "")
             val hasId = jobId.length == 64 && jobId.all { it in '0'..'9' || it in 'a'..'f' }
-            val title = if (hasId) name.dropLast(65) else name
+            // Strip "--<64hex>" fully (66 chars), not 65 — off-by-one left a trailing '-'.
+            val title = if (hasId) name.dropLast(66).ifEmpty { name } else name
             upsert(Doc("note", if (hasId) jobId else "file:$path", title,
                 f.parentFile?.relativeTo(notes.root)?.path ?: "", text, path,
                 jobSource[path] ?: "", stamp))

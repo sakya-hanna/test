@@ -298,28 +298,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
     private fun showMenu() {
-        val actions = arrayOf("LLM 接口设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "导出原文与笔记 ZIP")
+        val actions = arrayOf("LLM 接口设置", "向量检索设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "重建语义索引", "导出原文与笔记 ZIP")
         AlertDialog.Builder(this).setTitle("ChatNotes").setItems(actions) { _, index ->
             when (index) {
                 0 -> showSettings()
-                1 -> showConversations()
-                2 -> showJobs()
-                3 -> {
+                1 -> showEmbedSettings()
+                2 -> showConversations()
+                3 -> showJobs()
+                4 -> {
                     switchTab(true)
                     if (webViewDestroyed) showRendererRecovery()
                     else if (bridgeReady) webView.evaluateJavascript("window.__chatnotes && window.__chatnotes.captureDom()", null)
                     else toast("请先更新 Android System WebView")
                 }
-                4 -> {
+                5 -> {
                     toast("正在后台重建索引")
                     disk({ graph.search.rebuild(graph.notes, graph.db) }) { status ->
                         toast("索引完成：${status.indexedNotes} 篇笔记、${status.indexedConversations} 个对话${if (status.fts) "" else "（本机不支持 FTS5，已降级为子串匹配）"}")
                         render()
                     }
                 }
-                5 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
+                6 -> rebuildSemanticIndex()
+                7 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
             }
         }.show()
+    }
+
+    private fun rebuildSemanticIndex() {
+        val api = graph.embedApi()
+        if (api == null) { toast("请先在“向量检索设置”中配置 embedding 服务"); showEmbedSettings(); return }
+        toast("正在后台重建语义索引（分批调用向量接口）")
+        disk({
+            graph.search.clearEmbeddings(api.modelId)
+            graph.search.ensureEmbedded(graph.notes, graph.db, api)
+        }) { status ->
+            toast("语义索引完成：${status.chunks} 个片段（维度 ${status.dim}）")
+            render()
+        }
+    }
+
+    private fun showEmbedSettings() {
+        val wrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 24, 40, 16) }
+        fun field(label: String, value: String, hint: String, type: Int): EditText {
+            wrap.addView(TextView(this).apply { text = label })
+            return EditText(this).apply { inputType = type; setText(value); this.hint = hint; wrap.addView(this) }
+        }
+        val prefs = graph.config.prefs
+        val url = field("向量接口 Base URL（HTTPS，可留空关闭）", prefs.getString("embed_base_url", "") ?: "", "https://dashscope.aliyuncs.com/compatible-mode/v1", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val key = field("向量接口 API Key（可复用整理服务的 Key）", runCatching { graph.config.embedApiKey() }.getOrDefault(""), "由服务商提供", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        val model = field("向量模型（如 text-embedding-v4）", prefs.getString("embed_model", "") ?: "", "text-embedding-v4", InputType.TYPE_CLASS_TEXT)
+        AlertDialog.Builder(this).setTitle("向量检索设置").setView(ScrollView(this).apply { addView(wrap) })
+            .setPositiveButton("保存", null).setNegativeButton("取消", null)
+            .setNeutralButton("清空配置") { _, _ ->
+                disk({ graph.config.saveEmbed("", "", "") }) { toast("已关闭语义检索，使用关键词搜索") }
+            }
+            .create().apply {
+                setOnShowListener { getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    disk({ graph.config.saveEmbed(url.text.toString(), key.text.toString(), model.text.toString()) }) {
+                        dismiss(); toast(if (graph.config.embedConfigured()) "向量设置已保存，可在菜单重建语义索引" else "已清空，使用关键词搜索")
+                    }
+                } }
+                show()
+            }
     }
     private fun showConversations() {
         disk({ graph.db.conversations() }) { conversations ->
@@ -421,10 +461,9 @@ class MainActivity : AppCompatActivity() {
                 actual.add(name); current = child
             }
             val rows: List<Pair<Any, String>> = if (query.isNotEmpty()) {
-                // Full-text search across notes AND raw conversations; index synced first.
-                val status = graph.search.ensureIndexed(graph.notes, graph.db)
-                lastIndexStatus = status
-                graph.search.query(query).map { it to "" }
+                // Hybrid search: keyword + semantic (RRF), degrades to keyword offline.
+                graph.search.ensureIndexed(graph.notes, graph.db)
+                graph.search.hybridQuery(query, graph.embedApi()).map { it to "" }
             } else current.children
                 .sortedWith(compareByDescending<NotesRepo.Node> { it.isFolder }.thenByDescending { it.file.lastModified() }).map { it to "" }
             actual to rows

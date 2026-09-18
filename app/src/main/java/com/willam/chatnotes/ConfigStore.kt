@@ -51,6 +51,39 @@ class ConfigStore(context: Context) {
     }
     fun read(): ApiConfig = ApiConfig(prefs.getString("base_url", "") ?: "", apiKey(), prefs.getString("model", "") ?: "")
         .also { validate(it.baseUrl, it.model) }
+
+    // ---- embedding service config (stage 2) ----
+    @Synchronized fun embedApiKey(): String {
+        if (prefs.contains("embed_key")) {
+            val old = prefs.getString("embed_key", "") ?: ""
+            check(prefs.edit().putString("embed_key_encrypted", encrypted(old)).remove("embed_key").commit()) {
+                "向量密钥迁移失败"
+            }
+        }
+        val encoded = prefs.getString("embed_key_encrypted", "") ?: ""
+        if (encoded.isEmpty()) return ""
+        return try {
+            val bytes = Base64.decode(encoded, Base64.NO_WRAP)
+            require(bytes.size > 12)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+            String(cipher.doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8)
+        } catch (e: Exception) { throw IllegalStateException("无法解密向量密钥，请在设置中重新输入", e) }
+    }
+    @Synchronized fun saveEmbed(base: String, secret: String, model: String) {
+        val url = base.trim().trimEnd('/'); val name = model.trim()
+        if (url.isEmpty() && name.isEmpty() && secret.isEmpty()) {
+            // Clearing the embedding config is allowed; hybrid search degrades to keyword.
+            check(prefs.edit().remove("embed_base_url").remove("embed_model").remove("embed_key_encrypted").commit()) { "设置保存失败" }
+            return
+        }
+        validate(url, name)
+        require(secret.length <= 8192 && !secret.contains('\n') && !secret.contains('\r')) { "API Key 格式不正确" }
+        check(prefs.edit().putString("embed_base_url", url).putString("embed_model", name)
+            .putString("embed_key_encrypted", encrypted(secret.trim())).commit()) { "设置保存失败" }
+    }
+    fun embedConfigured(): Boolean =
+        !(prefs.getString("embed_base_url", "") ?: "").isNullOrBlank() && !(prefs.getString("embed_model", "") ?: "").isNullOrBlank()
     @Synchronized fun save(base: String, secret: String, model: String) {
         val url = base.trim().trimEnd('/'); val name = model.trim()
         validate(url, name)

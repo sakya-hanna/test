@@ -34,8 +34,10 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
                     "服务地址已更改，为避免把原文发送到未确认的地址，任务已暂停。请对该会话重新发起总结。"
                 }
                 val api = LlmClient(config.copy(model = inputJson.text("api_model", config.model))).also { client = it }
-                // The model must reuse existing categories instead of inventing near-duplicates.
-                val categories = runCatching { graph.notes.categoryPaths() }.getOrDefault(emptyList())
+                // Retrieval-based category injection (stage 2): candidates come from
+                // semantic top-k over notes when embedding is configured, keyword
+                // top-k otherwise; full list only as last resort.
+                val categories = categoryCandidates(graph, snapshot)
                 val input = snapshot.messages.joinToString("\n\n") {
                     "[消息 ${it.id}；${it.role}；状态 ${it.status}]\n${it.text}"
                 }
@@ -92,6 +94,54 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
     }
     private class Paused : RuntimeException()
     companion object {
+        /**
+         * Stage-2 category candidates: up to [max] distinct category paths,
+         * ranked by similarity between the conversation and existing notes.
+         * Embedding top-k when configured (query = first user messages),
+         * FTS keyword top-k otherwise, full list as final fallback.
+         */
+        internal fun categoryCandidates(graph: AppGraph, snapshot: ConversationSnapshot, max: Int = 12): List<List<String>> {
+            val queryText = snapshot.messages.filter { it.role == "user" }
+                .joinToString(" ") { it.text }.take(500)
+            if (queryText.isBlank()) return fullList(graph)
+            val candidates = LinkedHashMap<String, List<String>>() // pathKey -> path
+            fun addFrom(hits: List<SearchHit>) {
+                for (h in hits) {
+                    if (h.kind != "note") continue
+                    val parts = h.category.split('/').filter { it.isNotBlank() }
+                    if (parts.size in 2..4) candidates.putIfAbsent(parts.joinToString("/"), parts)
+                    if (candidates.size >= max) return
+                }
+            }
+            // 1) semantic
+            val embed = runCatching { graph.embedApi() }.getOrNull()
+            if (embed != null) {
+                runCatching {
+                    val vec = embed.embed(listOf(queryText)).first()
+                    graph.search.ensureIndexed(graph.notes, graph.db)
+                    val ranked = graph.search.vectorSearch(vec, embed.modelId)
+                    val hits = ranked.mapNotNull { (kind, id, _) ->
+                        graph.search.rawQueryDocument(kind, id)?.let { doc ->
+                            SearchHit(kind, java.io.File(doc.payload), doc.title, doc.category, doc.updatedAt,
+                                doc.title, 0, 0, 0, if (kind == "conv") id else doc.src, "", 0)
+                        }
+                    }
+                    addFrom(hits)
+                }
+            }
+            // 2) keyword fallback / supplement
+            if (candidates.size < max / 2) {
+                runCatching {
+                    graph.search.ensureIndexed(graph.notes, graph.db)
+                    addFrom(graph.search.query(SearchLogic.terms(queryText).take(4).joinToString(" ")))
+                }
+            }
+            if (candidates.isEmpty()) return fullList(graph)
+            return candidates.values.toList()
+        }
+        private fun fullList(graph: AppGraph): List<List<String>> =
+            runCatching { graph.notes.categoryPaths() }.getOrDefault(emptyList()).take(120)
+
         fun enqueue(context: Context, jobId: String) {
             val request = OneTimeWorkRequestBuilder<SummaryWorker>()
                 .setInputData(Data.Builder().putString("job_id", jobId).build())
