@@ -21,7 +21,11 @@ function install(fetch, href='https://chatgpt.com/c/c1', nodes=[]) {
     history:{pushState(){},replaceState(){}},document:{querySelectorAll(){return nodes;}},
     addEventListener(k,v){listeners[k]=v;},chatnotesProxy:{postMessage(s){sent.push(JSON.parse(s));}}};
   window.top=window;
-  vm.runInNewContext(source,{window,URL,TextDecoder,setTimeout,clearTimeout,Promise,Date,console});
+  // Title-sync polls the DOM briefly; a real interval would keep node alive,
+  // so the sandbox gets a self-clearing stub that never fires.
+  const stubInterval = () => 0;
+  vm.runInNewContext(source,{window,URL,TextDecoder,setTimeout,clearTimeout,
+    setInterval:stubInterval,clearInterval(){},Promise,Date,console});
   return {window,sent,listeners};
 }
 function finals(sent,id='a1'){return sent.filter(e=>e.type==='message'&&e.msgId===id);}
@@ -164,7 +168,8 @@ test('browser constructors and Worker options remain native after capture inject
     history:{pushState(){},replaceState(){}},document:{querySelectorAll(){return[];}},
     addEventListener(){},chatnotesProxy:{postMessage(){}}};
   window.top=window;
-  vm.runInNewContext(source,{window,URL,TextDecoder,setTimeout,clearTimeout,Promise,Date});
+  vm.runInNewContext(source,{window,URL,TextDecoder,setTimeout,clearTimeout,
+    setInterval:()=>0,clearInterval(){},Promise,Date});
   const options={type:'module',name:'parser',credentials:'include'};
   new window.Worker('module.js',options);
   assert.equal(calls[0].options,options);

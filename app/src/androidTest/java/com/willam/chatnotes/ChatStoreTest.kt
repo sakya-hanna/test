@@ -76,4 +76,22 @@ class ChatStoreTest {
         assertEquals(2,store.count("server")); assertEquals(2,store.count("other"))
         assertEquals("server",store.resolve("local:abc"))
     }
+    @Test fun emptyConversationShellsAreHiddenAndPruned() {
+        seed("real")
+        // Simulate login/navigation shells: created via 'active' events, no messages.
+        store.applyEvent(JSONObject().put("type","active").put("conversationId","local:shell1").put("url","https://chatgpt.com/"))
+        store.applyEvent(JSONObject().put("type","active").put("conversationId","WEB").put("url","https://chatgpt.com/"))
+        // Listing shows ONLY conversations with messages.
+        val listed = store.conversations().map { it.id }
+        assertEquals(listOf("real"), listed)
+        // Prune removes the shells but keeps the real conversation.
+        val removed = store.pruneEmptyConversations()
+        assertEquals(2, removed)
+        assertEquals(listOf("real"), store.conversations().map { it.id })
+    }
+    @Test fun conversationTitleFromEventsIsKept() {
+        seed("t1")
+        store.applyEvent(JSONObject().put("type","conversation").put("conversationId","t1").put("title","向量模型是什么"))
+        assertEquals("向量模型是什么", store.conversations().first { it.id == "t1" }.title)
+    }
 }

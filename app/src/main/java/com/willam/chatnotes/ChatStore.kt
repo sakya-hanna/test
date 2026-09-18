@@ -140,8 +140,23 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
         } finally { db.endTransaction() }
     }
     @Synchronized fun conversations(): List<ConversationInfo> = readableDatabase.rawQuery(
+        // Only conversations with captured messages are listed; login/navigation
+        // shells (0 messages) were polluting the picker (user report 2026-09-18).
         "SELECT c.id,c.title,c.url,COUNT(m.id),c.updated FROM conversations c JOIN messages m ON m.cid=c.id GROUP BY c.id ORDER BY c.updated DESC", null
     ).use { c -> buildList { while (c.moveToNext()) add(ConversationInfo(c.getString(0), c.getString(1).ifBlank { "未命名会话" }, c.getString(2), c.getInt(3), c.getLong(4))) } }
+    /** Drop empty shells (no messages, not referenced by aliases/jobs). */
+    @Synchronized fun pruneEmptyConversations(): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val deleted = db.delete("conversations",
+                "id NOT IN (SELECT DISTINCT cid FROM messages) AND " +
+                    "id NOT IN (SELECT target FROM aliases) AND " +
+                    "id NOT IN (SELECT cid FROM jobs)", null)
+            db.setTransactionSuccessful()
+            return deleted
+        } finally { db.endTransaction() }
+    }
     @Synchronized fun count(cid: String): Int = readableDatabase.rawQuery("SELECT COUNT(*) FROM messages WHERE cid=?", arrayOf(resolve(cid)))
         .use { it.moveToFirst(); it.getInt(0) }
     @Synchronized fun allMessages(cid: String): List<ChatMessage> = readableDatabase.rawQuery(

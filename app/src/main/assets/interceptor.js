@@ -28,7 +28,38 @@
       if (!routeId()) localId = uid('local:');
       lastRoute = path;
       activate(routeId() || localId);
+      scheduleTitleSync();
     }
+  }
+
+  // ---- Title fallback (new ChatGPT UI may never call /title endpoints) ----
+  var titleTimer = 0, lastTitle = '';
+  function extractDomTitle() {
+    if (!routeId()) return;
+    // Sidebar link for the current conversation carries its title.
+    var link = window.document.querySelector(
+      'a[href*="/c/' + routeId() + '"][aria-label], a[data-testid*="conversation"][href*="' + routeId() + '"]');
+    var label = '';
+    try { label = (link && link.getAttribute('aria-label') || '').replace(/^\s*(对话|Chat)\s*[:：]?\s*/i, '').trim(); } catch (_) {}
+    if (!label) {
+      // document.title is usually the conversation topic on chatgpt.com.
+      var t = String(window.document.title || '').trim();
+      if (t && !/^(chatgpt|new chat|新对话|登录|log in)/i.test(t)) label = t;
+    }
+    if (label && label !== lastTitle) {
+      lastTitle = label;
+      send({type: 'conversation', conversationId: routeId(), title: label.slice(0, 200)});
+    }
+  }
+  function scheduleTitleSync() {
+    if (titleTimer) return;
+    // Poll briefly after navigation: the sidebar and title settle asynchronously.
+    var tries = 0;
+    titleTimer = setInterval(function () {
+      tries++;
+      extractDomTitle();
+      if (tries >= 6 || lastTitle) { clearInterval(titleTimer); titleTimer = 0; }
+    }, 1000);
   }
   ['pushState', 'replaceState'].forEach(function (key) {
     var original = window.history[key];
@@ -40,6 +71,7 @@
   });
   window.addEventListener('popstate', routeChanged);
   routeChanged();
+  scheduleTitleSync();
 
   function extract(content) {
     var parts = content && content.parts, texts = [], attachments = false;

@@ -24,6 +24,7 @@ class AppGraph private constructor(context: Context) {
     val io = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue<Runnable>(512))
     init { io.execute {
         db.recoverInterruptedCapture()
+        db.pruneEmptyConversations()
         // The previous debug build logged fragments of every captured network message.
         java.io.File(app.filesDir, "intercept_log.txt").delete()
         runCatching { config.apiKey() } // Migrate the legacy key before any API request.
