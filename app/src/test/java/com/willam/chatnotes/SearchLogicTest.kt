@@ -59,6 +59,26 @@ class SearchLogicTest {
         val s = SearchLogic.snippet(body, "问题")!!
         assertEquals("问题", s.first.substring(s.second, s.third))
     }
+    @Test fun snippetsFindsAllNonOverlappingWindows() {
+        val body = "开头 白屏 第一次。" + "x".repeat(120) + "中间 白屏 第二次。" + "y".repeat(120) + "结尾 白屏 第三次。"
+        val all = SearchLogic.snippets(body, "白屏")
+        assertEquals(3, all.size)
+        assertEquals("白屏", all[0].first.substring(all[0].second, all[0].third))
+        assertEquals("白屏", all[1].first.substring(all[1].second, all[1].third))
+        assertEquals("白屏", all[2].first.substring(all[2].second, all[2].third))
+        // Windows advance: each snippet contains its ordinal marker.
+        assertTrue(all[0].first.contains("第一次"))
+        assertTrue(all[1].first.contains("第二次"))
+        assertTrue(all[2].first.contains("第三次"))
+    }
+    @Test fun snippetsRespectsMaxAndReturnsEmptyWithoutHits() {
+        val body = (1..10).joinToString(" ") { "hit$it " + "pad".repeat(30) }
+        assertEquals(3, SearchLogic.snippets(body, "hit", max = 3).size)
+        assertTrue(SearchLogic.snippets("无关内容", "白屏").isEmpty())
+        // snippet() stays consistent with snippets()'s first window.
+        val s = SearchLogic.snippet(body, "hit3")
+        assertEquals(s, SearchLogic.snippets(body, "hit3").first())
+    }
     @Test fun indexAndQuerySegmentationAreConsistent() {
         // The core recall invariant: whatever the user can type must be findable
         // in the token stream produced at index time.

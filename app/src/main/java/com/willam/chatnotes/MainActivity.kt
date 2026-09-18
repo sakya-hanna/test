@@ -59,6 +59,7 @@ class MainActivity : AppCompatActivity() {
     private var renderLimit = 200
     private var searchTask: Runnable? = null
     private var countTask: Runnable? = null
+    private var lastIndexStatus: SearchIndex.Status? = null
     private var rateWindow = 0L
     private var rateCount = 0
     private var observedJobs = false
@@ -421,7 +422,8 @@ class MainActivity : AppCompatActivity() {
             }
             val rows: List<Pair<Any, String>> = if (query.isNotEmpty()) {
                 // Full-text search across notes AND raw conversations; index synced first.
-                graph.search.ensureIndexed(graph.notes, graph.db)
+                val status = graph.search.ensureIndexed(graph.notes, graph.db)
+                lastIndexStatus = status
                 graph.search.query(query).map { it to "" }
             } else current.children
                 .sortedWith(compareByDescending<NotesRepo.Node> { it.isFolder }.thenByDescending { it.file.lastModified() }).map { it to "" }
@@ -436,8 +438,18 @@ class MainActivity : AppCompatActivity() {
                 })
             }
             if (rows.isEmpty()) listBox.addView(TextView(this).apply {
+                val statusExtra = if (query.isEmpty()) ""
+                else {
+                    val s = lastIndexStatus
+                    when {
+                        s == null -> ""
+                        !s.fts -> "\n（本机不支持 FTS5，当前为子串匹配模式）"
+                        s.dirty -> "\n（索引待更新，结果可能不全）"
+                        else -> ""
+                    }
+                }
                 text = if (query.isEmpty()) "暂无笔记。可在菜单中查看已保存对话和整理任务。"
-                else "没有找到匹配的笔记或对话"
+                else "没有找到匹配的笔记或对话$statusExtra"
                 setPadding(24, 80, 24, 24)
             })
             rows.take(limit).forEach { (item, _) ->
@@ -470,6 +482,7 @@ class MainActivity : AppCompatActivity() {
         val title = card.findViewById<TextView>(R.id.hitTitle)
         val sub = card.findViewById<TextView>(R.id.hitSnippet)
         val meta = card.findViewById<TextView>(R.id.hitMeta)
+        val more = card.findViewById<TextView>(R.id.hitMore)
         title.text = hit.title
         meta.text = buildString {
             append(if (hit.kind == "note") "笔记" else "对话")
@@ -477,11 +490,54 @@ class MainActivity : AppCompatActivity() {
             append(java.text.SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(hit.updatedAt)))
             if (hit.category.isNotBlank() && hit.kind == "note") { append(" · "); append(hit.category) }
         }
-        val span = android.text.SpannableString(hit.snippet)
-        if (hit.hitEnd > hit.hitStart && hit.hitEnd <= span.length)
-            span.setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD),
-                hit.hitStart, hit.hitEnd, android.text.SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
-        sub.text = span
+        fun span(text: String, start: Int, end: Int) = android.text.SpannableString(text).apply {
+            if (end > start && end <= length)
+                setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD),
+                    start, end, android.text.SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        sub.text = span(hit.snippet, hit.hitStart, hit.hitEnd)
+        if (hit.moreHits > 0) {
+            more.visibility = View.VISIBLE
+            more.text = "展开另外 ${hit.moreHits} 处命中"
+            var expanded = false
+            more.setOnClickListener {
+                expanded = !expanded
+                if (expanded) {
+                    disk({ runCatching { graph.notes.readNote(hit.file) } }) { result ->
+                        result.fold({ markdown ->
+                            val windows = SearchLogic.snippets(markdown, searchInput.text.toString().trim())
+                            if (windows.size > 1) {
+                                more.text = "收起"
+                                (more.parent as? android.view.ViewGroup)?.let { parent ->
+                                    val start = parent.indexOfChild(more)
+                                    windows.drop(1).forEachIndexed { i, w ->
+                                        val extra = TextView(this)
+                                        extra.tag = "extra-snippet"
+                                        extra.text = span(w.first, w.second, w.third)
+                                        extra.textSize = 13f
+                                        extra.setPadding(12, 4, 12, 4)
+                                        extra.setTextColor(android.graphics.Color.rgb(0x4B, 0x55, 0x63))
+                                        parent.addView(extra, start + 1 + i)
+                                    }
+                                }
+                            } else more.text = "其他命中在笔记其他位置"
+                        }, { toast("笔记文件已被移动或删除，可重建索引") })
+                    }
+                } else {
+                    more.text = "展开另外 ${hit.moreHits} 处命中"
+                    (card.parent as? android.view.ViewGroup)?.let { parent ->
+                        // Remove extra snippet views added after this card until the next card.
+                        val start = parent.indexOfChild(card)
+                        var i = start + 1
+                        while (i < parent.childCount) {
+                            val child = parent.getChildAt(i)
+                            if (child.tag == "extra-snippet") { parent.removeViewAt(i); continue }
+                            break
+                        }
+                    }
+                }
+            }
+        }
         card.setOnClickListener {
             when (hit.kind) {
                 "note" -> disk({ runCatching { graph.notes.readNote(hit.file) } }) { result ->

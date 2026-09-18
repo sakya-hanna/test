@@ -110,6 +110,34 @@ object SearchLogic {
     }
 
     /**
+     * All non-overlapping hit windows (up to max), earliest first.
+     * Used to show "N 处命中" expansion on a result card.
+     */
+    fun snippets(original: String, query: String, max: Int = 3, radius: Int = 48): List<Triple<String, Int, Int>> {
+        val lower = original.lowercase()
+        val found = mutableListOf<Triple<String, Int, Int>>()
+        var cursor = 0
+        while (found.size < max && cursor <= original.length) {
+            var bestStart = -1; var bestLen = 0
+            for (term in terms(query)) {
+                val idx = lower.indexOf(term.lowercase(), cursor)
+                if (idx >= 0 && (bestStart < 0 || idx < bestStart)) { bestStart = idx; bestLen = term.length }
+            }
+            if (bestStart < 0) break
+            var start = (bestStart - radius).coerceAtLeast(0)
+            var end = (bestStart + bestLen + radius).coerceAtMost(original.length)
+            if (start > 0 && Character.isHighSurrogate(original[start])) start++
+            if (end < original.length && Character.isHighSurrogate(original[end - 1])) end--
+            val lead = if (start > 0) 1 else 0
+            val text = (if (start > 0) "…" else "") + original.substring(start, end) + (if (end < original.length) "…" else "")
+            val hitStart = lead + (bestStart - start)
+            found.add(Triple(text, hitStart, hitStart + bestLen))
+            cursor = bestStart + bestLen
+        }
+        return found
+    }
+
+    /**
      * Window around the first query hit, plus the highlighted range inside it.
      * Returns null when nothing matches (caller then shows the note title only).
      */

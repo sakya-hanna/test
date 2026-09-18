@@ -34,4 +34,12 @@
         android:layout_marginTop="6dp"
         android:textSize="11sp"
         android:textColor="#9CA3AF" />
+    <TextView
+        android:id="@+id/hitMore"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textSize="12sp"
+        android:textColor="#10A37F"
+        android:visibility="gone" />
 </LinearLayout>

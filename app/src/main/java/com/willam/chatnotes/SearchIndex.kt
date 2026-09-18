@@ -16,7 +16,8 @@ data class SearchHit(
     val hitEnd: Int,
     val score: Int,
     val conversationId: String,
-    val conversationTitle: String
+    val conversationTitle: String,
+    val moreHits: Int = 0      // additional hit windows hidden behind "展开 N 处"
 )
 
 /**
@@ -29,9 +30,9 @@ data class SearchHit(
  * Devices without FTS5 search the same rows with LIKE; recall differs but
  * the two modes share all parsing and ranking code.
  */
-class SearchIndex(private val context: Context) {
+class SearchIndex(private val context: Context, name: String = "search.db") {
     private val db: SQLiteDatabase by lazy {
-        SQLiteDatabase.openOrCreateDatabase(File(context.filesDir, "search.db"), null)
+        SQLiteDatabase.openOrCreateDatabase(File(context.filesDir, name), null)
     }
     private var ftsMode = false
     private var schemaReady = false
@@ -222,13 +223,15 @@ class SearchIndex(private val context: Context) {
         val kind = r[0] as String
         val title = r[2] as String
         val body = r[4] as String
-        val snippetInfo = SearchLogic.snippet(body, trimmed)
+        val windows = SearchLogic.snippets(body, trimmed)
+        val first = windows.firstOrNull()
         // bm25(): more negative = better; normalize to a descending score.
         val score = (1000000 - ((r[8] as Double).absoluteValueSafe() * 1000).toInt()).coerceAtLeast(0)
         return SearchHit(kind, File(r[5] as String), title, r[3] as String, r[7] as Long,
-            snippetInfo?.first ?: title, snippetInfo?.second ?: 0, snippetInfo?.third ?: 0,
+            first?.first ?: title, first?.second ?: 0, first?.third ?: 0,
             score, if (kind == "conv") r[1] as String else r[6] as String,
-            if (kind == "conv") title else "")
+            if (kind == "conv") title else "",
+            (windows.size - 1).coerceAtLeast(0))
     }
 
     private fun Double.absoluteValueSafe(): Double = if (this < 0) -this else this

@@ -6,8 +6,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class NotesRepo(context: Context) {
-    private val files = NoteFiles(File(context.filesDir, "notes"))
+class NotesRepo(context: Context, dirName: String = "notes") {
+    private val files = NoteFiles(File(context.filesDir, dirName))
     val root: File get() = files.root()
     data class Node(val name: String, val isFolder: Boolean, val file: File) {
         var date: String = ""
