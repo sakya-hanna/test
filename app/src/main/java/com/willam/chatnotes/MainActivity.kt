@@ -2,41 +2,40 @@ package com.willam.chatnotes
 
 import android.annotation.SuppressLint
 import android.content.Intent
-import android.content.SharedPreferences
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.text.InputType
 import android.view.View
-import android.view.inputmethod.EditorInfo
-import android.webkit.JavascriptInterface
+import android.view.ViewGroup
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import androidx.work.WorkManager
 import io.noties.markwon.Markwon
 import org.json.JSONObject
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class MainActivity : AppCompatActivity() {
-
-    private lateinit var prefs: SharedPreferences
-    private lateinit var repo: NotesRepo
-    private lateinit var llm: LlmClient
+    private lateinit var graph: AppGraph
     private lateinit var markwon: Markwon
     private lateinit var webView: WebView
-
-    // 对话缓冲:user_msg / assistant_msg 按到达顺序累积
-    private val transcript = LinkedBlockingQueue<Pair<String, String>>()
-    private var conversationTitle: String = ""
-    private var summarized = false
-
     private lateinit var chatScreen: View
     private lateinit var notesScreen: View
-    private lateinit var settingsBtn: View
     private lateinit var captureInfo: TextView
     private lateinit var pathBar: LinearLayout
     private lateinit var listBox: LinearLayout
@@ -44,270 +43,437 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollView: ScrollView
     private lateinit var detailScroll: ScrollView
     private lateinit var detailBody: TextView
-
-    private var stack = mutableListOf<NotesRepo.Node>()
-
-    @SuppressLint("SetJavaScriptEnabled")
+    private val handler = Handler(Looper.getMainLooper())
+    private var selectedId = ""
+    private var captureState = "正在初始化"
+    private var captureWarning = false
+    private var bridgeReady = false
+    private var documentStart = false
+    private var script = ""
+    private var chatVisible = true
+    private var folders = mutableListOf<String>()
+    private var renderFuture: java.util.concurrent.Future<*>? = null
+    private var renderGeneration = 0
+    private var renderLimit = 200
+    private var searchTask: Runnable? = null
+    private var countTask: Runnable? = null
+    private var rateWindow = 0L
+    private var rateCount = 0
+    private var observedJobs = false
+    private val savedJobs = mutableSetOf<String>()
+    private val captureOwner = java.util.UUID.randomUUID().toString()
+    private var acceptingCapture = true
+    private var webViewDestroyed = false
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private val filePicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data))
+        fileCallback = null
+    }
+    private val exportPicker = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) exportTo(uri)
+    }
+    private fun ui(action: () -> Unit) = runOnUiThread { if (!isFinishing && !isDestroyed) action() }
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    private fun error(message: String) {
+        if (!isFinishing && !isDestroyed) AlertDialog.Builder(this).setTitle("操作未完成")
+            .setMessage(message).setPositiveButton("好", null).show()
+    }
+    private fun <T> disk(work: () -> T, done: (T) -> Unit) {
+        try {
+            graph.io.execute {
+                val result = runCatching(work)
+                ui { result.fold(done) { error(it.message ?: "文件或数据库操作失败，已保存的数据仍保留") } }
+            }
+        } catch (_: RejectedExecutionException) { error("保存队列繁忙，请稍后重试；可重新加载会话补采集") }
+    }
+    private fun <T> query(work: () -> T, done: (T) -> Unit) {
+        renderFuture?.cancel(true)
+        renderFuture = graph.queries.submit {
+            val result = runCatching(work)
+            if (!Thread.currentThread().isInterrupted) ui {
+                result.fold(done) { if (it !is InterruptedException) error(it.message ?: "读取笔记失败") }
+            }
+        }
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
-        prefs = getSharedPreferences("config", MODE_PRIVATE)
-        repo = NotesRepo(this)
-        llm = LlmClient(this)
-        markwon = Markwon.create(this)
-
-        chatScreen = findViewById(R.id.chatScreen)
-        notesScreen = findViewById(R.id.notesScreen)
-        settingsBtn = findViewById(R.id.settingsBtn)
-        captureInfo = findViewById(R.id.captureInfo)
-        pathBar = findViewById(R.id.pathBar)
-        listBox = findViewById(R.id.listBox)
-        searchInput = findViewById(R.id.searchInput)
-        scrollView = findViewById(R.id.browseScroll)
-        detailScroll = findViewById(R.id.detailScroll)
+        graph = AppGraph.get(this); markwon = Markwon.create(this)
+        chatScreen = findViewById(R.id.chatScreen); notesScreen = findViewById(R.id.notesScreen)
+        captureInfo = findViewById(R.id.captureInfo); pathBar = findViewById(R.id.pathBar)
+        listBox = findViewById(R.id.listBox); searchInput = findViewById(R.id.searchInput)
+        scrollView = findViewById(R.id.browseScroll); detailScroll = findViewById(R.id.detailScroll)
         detailBody = findViewById(R.id.detailBody)
-
-        setupWebView()
-        setupTabs()
-        setupNotes()
+        detailBody.setTextIsSelectable(true)
+        selectedId = graph.config.prefs.getString("last_conversation", "") ?: ""
+        setupWebView(savedInstanceState)
+        findViewById<View>(R.id.tabChat).setOnClickListener { switchTab(true) }
+        findViewById<View>(R.id.tabNotes).setOnClickListener { switchTab(false); render() }
+        findViewById<View>(R.id.settingsBtn).setOnClickListener { showMenu() }
+        captureInfo.setOnClickListener { if (webViewDestroyed) showRendererRecovery() else showConversations() }
+        searchInput.addTextChangedListener(object : android.text.TextWatcher {
+            override fun afterTextChanged(s: android.text.Editable?) {
+                renderGeneration++; renderLimit = 200
+                searchTask?.let { handler.removeCallbacks(it) }
+                searchTask = Runnable { render() }.also { handler.postDelayed(it, 300) }
+            }
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        })
+        // Migration and unfinished job recovery run after the once-per-process capture recovery.
+        disk({
+            graph.db.jobs().filter { it.state in setOf("queued", "running", "writing") }.forEach { SummaryWorker.enqueue(graph.app, it.id) }
+        }) { }
+        WorkManager.getInstance(this).getWorkInfosByTagLiveData("chatnotes-summary").observe(this) {
+            disk({ graph.db.jobs() }) { jobs ->
+                val completed = jobs.filter { it.state == "saved" }.map { it.id }.toSet()
+                if (observedJobs && (completed - savedJobs).isNotEmpty()) { toast("笔记已归档，可在知识库中查看"); render() }
+                savedJobs.addAll(completed); observedJobs = true
+            }
+        }
         render()
     }
-
-    // ================= WebView + 拦截 =================
-
-    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
-    private fun setupWebView() {
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun setupWebView(state: Bundle?) {
         webView = findViewById(R.id.webView)
-        val s = webView.settings
-        s.javaScriptEnabled = true
-        s.domStorageEnabled = true
-        // 伪装成 Chrome,降低 WebView 指纹差异带来的风控概率
-        s.userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-        webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest) = false
+        webView.settings.apply {
+            javaScriptEnabled = true; domStorageEnabled = true
+            allowFileAccess = false
+            allowContentAccess = true // Only user-selected content URIs are granted by the system picker.
+            javaScriptCanOpenWindowsAutomatically = false
+            // Keep the real WebView UA; a fabricated browser version breaks capability detection.
         }
-
-        // JavascriptInterface:页面注入脚本回传消息
-        webView.addJavascriptInterface(object : Any() {
-            @JavascriptInterface
-            fun postMessage(msg: String) {
-                runOnUiThread { handleIntercept(msg) }
-            }
-        }, "chatnotesProxy")
-
-        // document-start 注入:页面脚本运行前包装 fetch
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            WebViewCompat.addDocumentStartJavaScript(webView, InterceptorJs.SRC, setOf("https://chatgpt.com", "https://*.chatgpt.com"))
-        } else {
-            Toast.makeText(this, "WebView 版本过旧,拦截不可用,将退化为 DOM 抓取", Toast.LENGTH_LONG).show()
-        }
-
-        webView.loadUrl("https://chatgpt.com")
-    }
-
-    private fun handleIntercept(msg: String) {
-        runCatching {
-            val j = JSONObject(msg)
-            when (j.optString("type")) {
-                "user_msg" -> {
-                    transcript.offer("user" to j.optString("text"))
-                    updateCaptureInfo()
+        bridgeReady = WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
+        documentStart = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+        script = InterceptorJs.source(this)
+        if (bridgeReady) {
+            WebViewCompat.addWebMessageListener(webView, "chatnotesProxy", setOf("https://chatgpt.com")) { _, message, origin, mainFrame, _ ->
+                if (mainFrame && origin.scheme == "https" && origin.host == "chatgpt.com" && origin.port in setOf(-1, 443)) {
+                    val data = runCatching { message.data }.getOrNull()
+                    if (data != null) intercept(data)
                 }
-                "assistant_msg" -> {
-                    val t = j.optString("text").trim()
-                    if (t.isNotEmpty()) {
-                        transcript.offer("assistant" to t)
-                        updateCaptureInfo()
+            }
+            if (documentStart) WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("https://chatgpt.com"))
+        } else {
+            captureState = "当前 WebView 不支持安全采集，请更新 Android System WebView"
+            captureWarning = true; refreshCount()
+        }
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                if (!request.isForMainFrame) return false
+                val uri = request.url
+                if (allowedNavigation(uri)) return false
+                if (uri.scheme in setOf("http", "https")) runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                    .onFailure { toast("无法打开外部链接") }
+                else toast("不支持此链接类型")
+                return true
+            }
+            override fun onPageFinished(view: WebView, url: String) {
+                val uri = Uri.parse(url)
+                if (bridgeReady && uri.scheme == "https" && uri.host == "chatgpt.com" && !documentStart) {
+                    view.evaluateJavascript(script, null)
+                    view.evaluateJavascript("window.__chatnotes && window.__chatnotes.captureDom()", null)
+                }
+            }
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                acceptingCapture = false
+                closeCapture()
+                (view.parent as? ViewGroup)?.removeView(view)
+                view.destroy()
+                webViewDestroyed = true
+                captureState = "网页已退出，点此恢复；已保存的原文仍保留"
+                captureWarning = true; refreshCount()
+                showRendererRecovery()
+                return true
+            }
+        }
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(view: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                fileCallback?.onReceiveValue(null); fileCallback = callback
+                return try {
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).apply {
+                        type = "*/*"
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, params.mode == FileChooserParams.MODE_OPEN_MULTIPLE)
+                        val types = params.acceptTypes.filter { it.contains('/') && !it.contains(';') }.toTypedArray()
+                        if (types.isNotEmpty()) putExtra(Intent.EXTRA_MIME_TYPES, types)
+                    }
+                    filePicker.launch(intent); true
+                } catch (_: Exception) { fileCallback?.onReceiveValue(null); fileCallback = null; false }
+            }
+        }
+        if (state == null || webView.restoreState(state) == null) {
+            val last = graph.config.prefs.getString("last_url", "https://chatgpt.com") ?: "https://chatgpt.com"
+            webView.loadUrl(if (allowedNavigation(Uri.parse(last))) last else "https://chatgpt.com")
+        }
+    }
+    private fun allowedNavigation(uri: Uri): Boolean = uri.scheme == "https" && uri.port in setOf(-1, 443) &&
+        uri.host in setOf("chatgpt.com", "chat.openai.com", "auth.openai.com", "auth0.openai.com") && uri.userInfo == null
+    private fun intercept(raw: String) {
+        if (!acceptingCapture) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - rateWindow >= 1000) { rateWindow = now; rateCount = 0 }
+        rateCount++
+        if (raw.length > 256 * 1024 || rateCount > 200) {
+            captureState = "采集输入超过上限，部分内容未保存，请重新加载会话补采集"
+            captureWarning = true; refreshCount(); return
+        }
+        val j = runCatching { JSONObject(raw) }.getOrElse {
+            captureState = "收到无法解析的采集数据"; captureWarning = true; refreshCount(); return
+        }
+        when (j.text("type")) {
+            "ready" -> { captureState = if (documentStart) "采集中" else "页面补采集模式"; captureWarning = !documentStart; refreshCount() }
+            "notice" -> { captureState = j.text("message").take(160); captureWarning = true; refreshCount() }
+            "active", "conversation", "message", "remap", "request" -> try {
+                graph.io.execute {
+                    val result = runCatching { graph.db.applyEvent(j.put("owner", captureOwner)) }
+                    ui {
+                        result.fold({ cid ->
+                            if (j.text("type") == "active" || j.text("type") == "remap" && selectedId == j.text("from")) {
+                                selectedId = cid
+                                graph.config.prefs.edit().putString("last_conversation", cid).apply()
+                            }
+                            val url = j.text("url")
+                            if (j.text("type") == "active" && url.isNotEmpty() && allowedNavigation(Uri.parse(url)))
+                                graph.config.prefs.edit().putString("last_url", url).apply()
+                            refreshCount()
+                        }, {
+                            captureState = "原文保存失败，请检查空间并重新加载会话补采集"
+                            captureWarning = true; refreshCount()
+                        })
                     }
                 }
-                "title" -> {
-                    conversationTitle = j.optString("title")
+            } catch (_: RejectedExecutionException) {
+                captureState = "保存队列已满，部分内容未保存，请稍后补采集"; captureWarning = true; refreshCount()
+            }
+        }
+    }
+    private fun refreshCount() {
+        if (countTask != null) return
+        countTask = Runnable {
+            countTask = null
+            val id = selectedId
+            disk({ if (id.isEmpty()) 0 else graph.db.count(id) }) { count ->
+                if (id == selectedId) {
+                    captureInfo.text = "$captureState · 已保存 $count 条（点此查看）"
+                    captureInfo.setTextColor(if (captureWarning) Color.rgb(170, 80, 0) else Color.rgb(0, 130, 85))
                 }
             }
+        }.also { handler.postDelayed(it, 300) }
+    }
+    fun onCloseChat(view: View) {
+        if (selectedId.isEmpty()) { toast("还没有已保存的会话"); return }
+        if (webViewDestroyed) { prepareSummary(selectedId); return }
+        webView.evaluateJavascript("window.__chatnotes && window.__chatnotes.flush()") { prepareSummary(selectedId) }
+    }
+    private fun showRendererRecovery() {
+        if (!isFinishing && !isDestroyed) AlertDialog.Builder(this)
+            .setTitle("网页需要重新加载")
+            .setMessage("已落盘的原文和笔记会保留。恢复后请核对未完成的回复；不会自动重发提问。")
+            .setPositiveButton("恢复网页") { _, _ -> recreate() }
+            .setNegativeButton("稍后", null).show()
+    }
+    private fun prepareSummary(cid: String) {
+        disk({ graph.config.read() to graph.db.snapshot(cid) }) { (config, snapshot) ->
+            val text = "将把此分支的 ${snapshot.messages.size} 条消息发送到 ${Uri.parse(config.baseUrl).host} 整理。\n" +
+                "原始对话会保留，后续新消息可再次归档。长对话会分段调用 API。\n\n" +
+                snapshot.warnings.joinToString("\n") { "注意：$it" }
+            AlertDialog.Builder(this).setTitle("总结“${snapshot.title}”？").setMessage(text)
+                .setPositiveButton("总结并归档") { _, _ ->
+                    disk({
+                        val job = graph.db.createJob(snapshot, config)
+                        if (job.state != "saved") {
+                            // Reuse the immutable snapshot and completed checkpoints on manual retry.
+                            if (job.state == "failed") graph.db.updateJob(job.id, "queued")
+                            SummaryWorker.enqueue(graph.app, job.id)
+                        }
+                        job
+                    }) { job ->
+                        toast(if (job.state == "saved") "这份原文快照已归档，无需重复生成" else "已加入整理任务，离开此页面后仍可继续")
+                        switchTab(false); render()
+                    }
+                }.setNeutralButton("查看原文") { _, _ -> showConversation(cid) }.setNegativeButton("取消", null).show()
         }
     }
-
-    private fun updateCaptureInfo() {
-        captureInfo.text = "旁听中 · 本次已捕获 ${transcript.size} 条消息"
-    }
-
-    /** 关闭页面按钮 → 总结流程 */
-    fun onCloseChat(v: View) {
-        if (transcript.isEmpty()) {
-            Toast.makeText(this, "本次没有拦截到对话内容", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (summarized) { switchTab(false); return }
-        AlertDialog.Builder(this)
-            .setTitle("总结本次对话?")
-            .setMessage("已捕获 ${transcript.size} 条消息,将调用你配置的 LLM 总结并归档。")
-            .setPositiveButton("总结") { _, _ -> runSummary() }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
-    private fun runSummary() {
-        val msgs = transcript.toList()
-        val dlg = AlertDialog.Builder(this)
-            .setTitle("正在总结…")
-            .setMessage("收集对话 → LLM 总结 → 归类 → 写入 Markdown")
-            .setCancelable(false)
-            .show()
-        llm.summarize(msgs) { res ->
-            runOnUiThread {
-                dlg.dismiss()
-                res.fold({
-                    val f = repo.writeNote(it.path, it.markdown)
-                    summarized = true
-                    Toast.makeText(this, "已保存:${it.path.joinToString(" / ")}", Toast.LENGTH_LONG).show()
-                    stack.clear(); stack.add(repo.tree())
-                    switchTab(false); render()
-                }, {
-                    AlertDialog.Builder(this)
-                        .setTitle("总结失败")
-                        .setMessage(it.message ?: "未知错误")
-                        .setPositiveButton("好", null)
-                        .show()
-                })
+    private fun showMenu() {
+        val actions = arrayOf("LLM 接口设置", "已保存对话", "整理任务与重试", "补采集当前网页", "导出原文与笔记 ZIP")
+        AlertDialog.Builder(this).setTitle("ChatNotes").setItems(actions) { _, index ->
+            when (index) {
+                0 -> showSettings()
+                1 -> showConversations()
+                2 -> showJobs()
+                3 -> {
+                    switchTab(true)
+                    if (webViewDestroyed) showRendererRecovery()
+                    else if (bridgeReady) webView.evaluateJavascript("window.__chatnotes && window.__chatnotes.captureDom()", null)
+                    else toast("请先更新 Android System WebView")
+                }
+                4 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
             }
+        }.show()
+    }
+    private fun showConversations() {
+        disk({ graph.db.conversations() }) { conversations ->
+            if (conversations.isEmpty()) { toast("尚无已保存的原文"); return@disk }
+            AlertDialog.Builder(this).setTitle("已保存对话（含原文）")
+                .setItems(conversations.map { "${it.title} · ${it.count} 条" }.toTypedArray()) { _, i -> showConversation(conversations[i].id) }
+                .setNegativeButton("关闭", null).show()
         }
     }
-
-    // ================= Tab / 设置 =================
-
-    private fun setupTabs() {
-        findViewById<View>(R.id.tabChat).setOnClickListener { switchTab(true) }
-        findViewById<View>(R.id.tabNotes).setOnClickListener { switchTab(false) }
-        settingsBtn.setOnClickListener { showSettings() }
+    private fun showConversation(cid: String) {
+        disk({
+            val conversation = graph.db.conversations().firstOrNull { it.id == graph.db.resolve(cid) }
+            val messages = graph.db.allMessages(cid)
+            val content = buildString {
+                append("保留了已捕获的各个分支；总结使用最后浏览或生成的分支。\n\n")
+                for (m in messages) {
+                    if (length > 100000) { append("\n显示已截短，完整原文可从菜单导出。\n"); break }
+                    append(if (m.role == "user") "【用户" else "【助手")
+                    append(" · ${m.status}】\n${m.text}\n\n")
+                }
+            }
+            conversation to content
+        }) { (conversation, content) ->
+            val body = TextView(this).apply { text = content; textSize = 14f; setPadding(24, 24, 24, 24); setTextIsSelectable(true) }
+            AlertDialog.Builder(this).setTitle(conversation?.title ?: "原始对话")
+                .setView(ScrollView(this).apply { addView(body) })
+                .setPositiveButton("总结当前分支") { _, _ -> prepareSummary(cid) }
+                .setNeutralButton("打开原会话") { _, _ ->
+                    val url = conversation?.url.orEmpty()
+                    if (webViewDestroyed) showRendererRecovery()
+                    else if (url.isNotEmpty() && allowedNavigation(Uri.parse(url))) { switchTab(true); webView.loadUrl(url) }
+                    else toast("该会话尚未取得原平台地址，原文可导出")
+                }.setNegativeButton("关闭", null).show()
+        }
     }
-
+    private fun showJobs() {
+        disk({ graph.db.jobs() }) { jobs ->
+            if (jobs.isEmpty()) { toast("暂无整理任务"); return@disk }
+            val labels = mapOf("queued" to "等待继续", "running" to "整理中", "writing" to "保存中", "failed" to "失败，可重试", "saved" to "已归档")
+            AlertDialog.Builder(this).setTitle("整理任务")
+                .setItems(jobs.map { "${labels[it.state] ?: it.state} · ${runCatching { JSONObject(it.snapshot).text("title") }.getOrDefault("会话")}" }.toTypedArray()) { _, index ->
+                    val job = jobs[index]
+                    if (job.state == "saved") { switchTab(false); render() }
+                    else AlertDialog.Builder(this).setTitle(labels[job.state]).setMessage(job.error.ifBlank { "已保存原文与处理进度，可离开页面。" })
+                        .setPositiveButton("继续 / 重试") { _, _ ->
+                            disk({ graph.config.read(); graph.db.updateJob(job.id, "queued"); SummaryWorker.enqueue(graph.app, job.id) }) { toast("任务已提交") }
+                        }.setNegativeButton("关闭", null).show()
+                }.setNegativeButton("关闭", null).show()
+        }
+    }
+    private fun showSettings() {
+        disk({ runCatching { graph.config.apiKey() } }) { keyResult ->
+            if (keyResult.isFailure) toast("旧密钥无法读取，请重新输入后保存")
+            val wrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 24, 40, 16) }
+            fun field(label: String, value: String, hint: String, type: Int): EditText {
+                wrap.addView(TextView(this).apply { text = label })
+                return EditText(this).apply { inputType = type; setText(value); this.hint = hint; wrap.addView(this) }
+            }
+            val prefs = graph.config.prefs
+            val url = field("API Base URL（HTTPS）", prefs.getString("base_url", "") ?: "", "https://api.openai.com/v1", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+            val key = field("API Key", keyResult.getOrDefault(""), "由你选择的服务商提供", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+            val model = field("模型名称", prefs.getString("model", "") ?: "", "填写服务商支持的模型 ID", InputType.TYPE_CLASS_TEXT)
+            val dialog = AlertDialog.Builder(this).setTitle("整理模型设置").setView(ScrollView(this).apply { addView(wrap) })
+                .setPositiveButton("保存", null).setNegativeButton("取消", null).create()
+            dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val base = url.text.toString(); val secret = key.text.toString(); val name = model.text.toString()
+                disk({ graph.config.save(base, secret, name) }) { dialog.dismiss(); toast("设置已保存") }
+            } }
+            dialog.show()
+        }
+    }
+    private fun exportTo(uri: Uri) {
+        val resolver = applicationContext.contentResolver
+        disk({
+            val output = requireNotNull(resolver.openOutputStream(uri, "w")) { "无法创建导出文件" }
+            ZipOutputStream(output.buffered()).use { zip ->
+                zip.putNextEntry(ZipEntry("conversations.json")); zip.write(graph.db.exportJson().toByteArray(Charsets.UTF_8)); zip.closeEntry()
+                graph.notes.allFiles().forEach { file ->
+                    zip.putNextEntry(ZipEntry("notes/" + file.relativeTo(graph.notes.root).invariantSeparatorsPath))
+                    file.inputStream().use { it.copyTo(zip) }; zip.closeEntry()
+                }
+            }
+        }) { toast("原文与笔记已导出，未导出接口配置与登录状态") }
+    }
     private fun switchTab(chat: Boolean) {
+        chatVisible = chat
         chatScreen.visibility = if (chat) View.VISIBLE else View.GONE
         notesScreen.visibility = if (chat) View.GONE else View.VISIBLE
         findViewById<View>(R.id.tabChat).alpha = if (chat) 1f else 0.45f
         findViewById<View>(R.id.tabNotes).alpha = if (chat) 0.45f else 1f
     }
-
-    private fun showSettings() {
-        val wrap = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 32, 48, 16)
-        }
-        fun field(label: String, key: String, hint: String, inputType: Int): EditText {
-            val et = EditText(this)
-            et.hint = hint
-            et.inputType = inputType
-            et.setText(prefs.getString(key, ""))
-            wrap.addView(TextView(this).apply { text = label })
-            wrap.addView(et)
-            return et
-        }
-        val url = field("API Base URL", "base_url", "https://api.openai.com/v1", EditorInfo.TYPE_TEXT_VARIATION_URI)
-        val key = field("API Key", "api_key", "sk-…", EditorInfo.TYPE_TEXT_VARIATION_PASSWORD)
-        val model = field("模型", "model", "gpt-4o-mini / glm-4 / deepseek-chat …", EditorInfo.TYPE_CLASS_TEXT)
-
-        AlertDialog.Builder(this)
-            .setTitle("LLM 接口设置")
-            .setView(wrap)
-            .setPositiveButton("保存") { _, _ ->
-                prefs.edit()
-                    .putString("base_url", url.text.toString().trim())
-                    .putString("api_key", key.text.toString().trim())
-                    .putString("model", model.text.toString().trim())
-                    .apply()
-                Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
-    // ================= 笔记浏览 =================
-
-    private fun setupNotes() {
-        searchInput.addTextChangedListener(object : android.text.TextWatcher {
-            override fun afterTextChanged(s: android.text.Editable?) { render() }
-            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-        })
-    }
-
     private fun render() {
-        if (stack.isEmpty()) stack.add(repo.tree())
-        renderBreadcrumb()
-        listBox.removeAllViews()
-        val q = searchInput.text.toString().trim()
-        val cur = stack.last()
-        if (q.isNotEmpty()) {
-            repo.search(q).forEach { (n, path) ->
-                addRow(n, path) { openDetail(n) }
+        val generation = ++renderGeneration
+        val query = searchInput.text.toString().trim(); val desired = folders.toList(); val limit = renderLimit
+        query({
+            val root = graph.notes.tree(); var current = root; val actual = mutableListOf<String>()
+            for (name in desired) {
+                val child = current.children.firstOrNull { it.isFolder && it.name == name } ?: break
+                actual.add(name); current = child
             }
-            return
-        }
-        val items = cur.children.sortedWith(compareByDescending<NotesRepo.Node> { it.isFolder }.thenByDescending { it.date })
-        if (items.isEmpty()) {
-            val tv = TextView(this)
-            tv.text = "此分类下暂无笔记\n结束一次对话后会自动归档到这里"
-            tv.gravity = android.view.Gravity.CENTER
-            tv.setPadding(0, 160, 0, 160)
-            listBox.addView(tv)
-        }
-        items.forEach { it ->
-            if (it.isFolder) addRow(it, null) { stack.add(it); searchInput.setText(""); render() }
-            else addRow(it, null) { openDetail(it) }
-        }
-    }
-
-    private fun addRow(n: NotesRepo.Node, sub: String?, onClick: () -> Unit) {
-        val row = layoutInflater.inflate(R.layout.row_note, listBox, false) as LinearLayout
-        row.findViewById<TextView>(R.id.rowTitle).text = n.name
-        row.findViewById<TextView>(R.id.rowSub).text = when {
-            sub != null -> sub
-            n.isFolder -> "${countNotes(n)} 篇笔记"
-            else -> n.date
-        }
-        row.setOnClickListener { onClick() }
-        listBox.addView(row)
-    }
-
-    private fun countNotes(n: NotesRepo.Node): Int =
-        n.children.sumOf { if (it.isFolder) countNotes(it) else 1 }
-
-    private fun renderBreadcrumb() {
-        pathBar.removeAllViews()
-        stack.forEachIndexed { i, node ->
-            if (i > 0) pathBar.addView(TextView(this).apply { text = " / " })
-            pathBar.addView(TextView(this).apply {
-                text = if (i == 0) "知识库" else node.name
-                textSize = 13f
-                setPadding(8, 8, 8, 8)
-                if (i < stack.size - 1) setOnClickListener {
-                    stack = stack.subList(0, i + 1).toMutableList()
-                    render()
+            val rows = if (query.isNotEmpty()) graph.notes.search(query) else current.children
+                .sortedWith(compareByDescending<NotesRepo.Node> { it.isFolder }.thenByDescending { it.file.lastModified() }).map { it to "" }
+            actual to rows
+        }) { (actual, rows) ->
+            if (generation != renderGeneration) return@query
+            folders = actual; pathBar.removeAllViews(); listBox.removeAllViews()
+            (listOf("知识库") + folders).forEachIndexed { i, name ->
+                pathBar.addView(TextView(this).apply {
+                    text = if (i == 0) name else " / $name"; textSize = 13f; setPadding(8, 12, 8, 12)
+                    setOnClickListener { folders = folders.take(i).toMutableList(); renderLimit = 200; searchInput.setText(""); render() }
+                })
+            }
+            if (rows.isEmpty()) listBox.addView(TextView(this).apply {
+                text = if (query.isEmpty()) "暂无笔记。可在菜单中查看已保存对话和整理任务。" else "没有找到匹配笔记"
+                setPadding(24, 80, 24, 24)
+            })
+            rows.take(limit).forEach { (n, path) ->
+                val row = layoutInflater.inflate(R.layout.row_note, listBox, false)
+                row.findViewById<TextView>(R.id.rowTitle).text = n.name
+                row.findViewById<TextView>(R.id.rowSub).text = if (query.isNotEmpty()) path else if (n.isFolder) "分类" else n.date
+                row.setOnClickListener {
+                    if (n.isFolder) { folders.add(n.name); renderLimit = 200; render() }
+                    else disk({ graph.notes.readNote(n.file) }) { markdown ->
+                        markwon.setMarkdown(detailBody, markdown); scrollView.visibility = View.GONE; detailScroll.visibility = View.VISIBLE
+                    }
                 }
+                listBox.addView(row)
+            }
+            if (rows.size > limit) listBox.addView(Button(this).apply {
+                text = "显示更多（已显示 $limit / ${rows.size}）"; setOnClickListener { renderLimit += 200; render() }
             })
         }
     }
-
-    private fun openDetail(n: NotesRepo.Node) {
-        val path = stack.drop(1).joinToString(" / ") { it.name }
-        markwon.setMarkdown(detailBody, repo.readNote(n.file))
-        scrollView.visibility = View.GONE
-        detailScroll.visibility = View.VISIBLE
-    }
-
-    fun onBackFromDetail(v: View) {
-        detailScroll.visibility = View.GONE
-        scrollView.visibility = View.VISIBLE
-    }
-
+    fun onBackFromDetail(view: View) { detailScroll.visibility = View.GONE; scrollView.visibility = View.VISIBLE }
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
-            detailScroll.visibility == View.VISIBLE -> onBackFromDetail(detailScroll)
-            stack.size > 1 -> { stack.removeAt(stack.size - 1); render() }
-            webView.canGoBack() -> webView.goBack()
+            !chatVisible && detailScroll.visibility == View.VISIBLE -> onBackFromDetail(detailScroll)
+            !chatVisible && folders.isNotEmpty() -> { folders.removeAt(folders.lastIndex); render() }
+            chatVisible && !webViewDestroyed && webView.canGoBack() -> webView.goBack()
+            !chatVisible -> switchTab(true)
             else -> super.onBackPressed()
         }
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        if (!webViewDestroyed) webView.saveState(outState)
+        super.onSaveInstanceState(outState)
+    }
+    private fun closeCapture() {
+        val cleanup = Runnable { runCatching { graph.db.closeCapture(captureOwner) } }
+        try { graph.io.execute(cleanup) }
+        catch (_: RejectedExecutionException) { Thread { graph.io.queue.put(cleanup) }.start() }
+    }
+    override fun onDestroy() {
+        acceptingCapture = false
+        closeCapture()
+        renderFuture?.cancel(true)
+        handler.removeCallbacksAndMessages(null)
+        fileCallback?.onReceiveValue(null); fileCallback = null
+        if (!webViewDestroyed) {
+            webView.stopLoading()
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            webView.destroy()
+        }
+        super.onDestroy()
     }
 }

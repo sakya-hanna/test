@@ -1,0 +1,68 @@
+package com.willam.chatnotes;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.text.Normalizer;
+import java.util.List;
+
+/** Platform-independent, immutable note files. Existing jobs can be resumed idempotently. */
+public final class NoteFiles {
+    private final File root;
+    public NoteFiles(File root) throws IOException {
+        this.root = root.getCanonicalFile();
+        if (!this.root.isDirectory() && !this.root.mkdirs()) throw new IOException("无法创建笔记目录");
+    }
+    public static String segment(String raw, int maxCodePoints) {
+        if (raw == null) throw new IllegalArgumentException("名称不能为空");
+        String s = Normalizer.normalize(raw, Normalizer.Form.NFC).trim();
+        if (s.isEmpty() || s.equals(".") || s.equals("..") || s.startsWith("/") || s.startsWith("\\"))
+            throw new IllegalArgumentException("分类或标题不是有效名称");
+        // Common titles such as C/C++ become safe labels. They never become paths.
+        s = s.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_");
+        int count = s.codePointCount(0, s.length());
+        if (count > maxCodePoints) s = s.substring(0, s.offsetByCodePoints(0, maxCodePoints));
+        if (s.equals(".") || s.equals("..")) throw new IllegalArgumentException("禁止父目录路径");
+        return s;
+    }
+    public File contained(File file) throws IOException {
+        File target = file.getCanonicalFile();
+        if (target.equals(root) || !target.toPath().startsWith(root.toPath()))
+            throw new IOException("文件超出笔记目录");
+        return target;
+    }
+    public File root() { return root; }
+    public File write(List<String> categories, String title, String id, String markdown) throws IOException {
+        if (categories == null || categories.size() < 2 || categories.size() > 4)
+            throw new IllegalArgumentException("分类必须为 2 至 4 级");
+        if (id == null || !id.matches("[a-f0-9]{64}")) throw new IllegalArgumentException("无效笔记 ID");
+        if (markdown == null || markdown.trim().isEmpty() || markdown.length() > 500000)
+            throw new IllegalArgumentException("笔记正文为空或过长");
+        synchronized (NoteFiles.class) {
+            File dir = root;
+            for (String part : categories) {
+                dir = contained(new File(dir, segment(part, 60)));
+                if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("无法创建分类目录，可能存在同名文件");
+            }
+            File target = contained(new File(dir, segment(title, 40) + "--" + id + ".md"));
+            byte[] bytes = markdown.getBytes(StandardCharsets.UTF_8);
+            if (target.exists()) {
+                if (java.util.Arrays.equals(Files.readAllBytes(target.toPath()), bytes)) return target;
+                throw new IOException("同一任务已有不同内容的笔记，拒绝覆盖");
+            }
+            File tmp = File.createTempFile(".pending-", ".tmp", dir);
+            try {
+                try (FileOutputStream out = new FileOutputStream(tmp)) {
+                    out.write(bytes);
+                    out.getFD().sync();
+                }
+                // Fail safely if the filesystem cannot perform an atomic rename.
+                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE);
+                return target;
+            } finally { Files.deleteIfExists(tmp.toPath()); }
+        }
+    }
+}
