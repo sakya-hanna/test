@@ -71,3 +71,38 @@ class EmbeddingLogicTest {
         assertEquals(listOf("x", "y", "z"), fused.map { it.first })
     }
 }
+
+class CategoryContextTest {
+    @Test fun rendersCandidatesWithSamplesAndRelevance() {
+        val cs = listOf(
+            CategoryCandidate(listOf("计算机", "Android"), listOf("WebView 白屏修复", "渲染进程退出处理"), 0.72f, true),
+            CategoryCandidate(listOf("工具", "Git"), listOf("rebase 工作流"), 0.41f, true),
+            CategoryCandidate(listOf("未分类", "杂项"), emptyList(), 0f, false)
+        )
+        val text = renderCategoryContext(cs)
+        assertTrue(text.contains("计算机 / Android（高度相关）"))
+        assertTrue(text.contains("｜已有笔记：WebView 白屏修复、渲染进程退出处理"))
+        assertTrue(text.contains("工具 / Git（较相关）"))
+        // keyword-only candidates get no relevance tag
+        assertTrue(text.contains("未分类 / 杂项\n") || text.contains("未分类 / 杂项\r") || Regex("未分类 / 杂项($|｜)").containsMatchIn(text))
+        // overlap-warning rule only when samples exist
+        assertTrue(text.contains("与《标题》相关，可考虑合并"))
+        // boundaries
+        assertTrue(renderCategoryContext(emptyList()).isEmpty())
+    }
+    @Test fun boundsInjectedLines() {
+        val many = (1..30).map { CategoryCandidate(listOf("a$it", "b$it"), listOf("t$it"), 0.6f, true) }
+        val text = renderCategoryContext(many)
+        assertTrue(text.lines().count { it.startsWith("- ") } <= 16)
+        val longTitle = CategoryCandidate(listOf("x".repeat(300), "y"), listOf("z".repeat(300)), 0.9f, true)
+        assertTrue(renderCategoryContext(listOf(longTitle)).lines().none { it.length > 400 })
+    }
+    @Test fun lowRelevanceBracketAndNoSamplesRule() {
+        val cs = listOf(CategoryCandidate(listOf("a", "b"), emptyList(), 0.2f, true))
+        val text = renderCategoryContext(cs)
+        assertTrue(text.contains("a / b（低相关）"))
+        // no samples anywhere -> generic synonym rule instead of merge hint
+        assertTrue(text.contains("不要新建与上面列表同义"))
+        assertFalse(text.contains("可考虑合并"))
+    }
+}

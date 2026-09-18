@@ -37,7 +37,7 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
                 // Retrieval-based category injection (stage 2): candidates come from
                 // semantic top-k over notes when embedding is configured, keyword
                 // top-k otherwise; full list only as last resort.
-                val categories = categoryCandidates(graph, snapshot)
+                val candidates = categoryCandidates(graph, snapshot)
                 val input = snapshot.messages.joinToString("\n\n") {
                     "[消息 ${it.id}；${it.role}；状态 ${it.status}]\n${it.text}"
                 }
@@ -48,7 +48,7 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
                     // Checkpoint before approaching WorkManager's normal execution time budget.
                     if (callsThisRun >= 3 || System.currentTimeMillis() - started > 210000) throw Paused()
                     callsThisRun++
-                    val partial = api.summarize(content, merge, categories)
+                    val partial = api.summarize(content, merge, candidates)
                     db.savePart(id, key, partial.json())
                     return partial
                 }
@@ -95,52 +95,65 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
     private class Paused : RuntimeException()
     companion object {
         /**
-         * Stage-2 category candidates: up to [max] distinct category paths,
-         * ranked by similarity between the conversation and existing notes.
-         * Embedding top-k when configured (query = first user messages),
-         * FTS keyword top-k otherwise, full list as final fallback.
+         * Retrieval-based category candidates for the summarizer prompt.
+         * Ranking: embedding top-k when configured (semantic=true, cosine score),
+         * FTS keyword top-k otherwise; full list as last resort (score=0).
+         * Each candidate carries up to [samples] existing note titles under it.
          */
-        internal fun categoryCandidates(graph: AppGraph, snapshot: ConversationSnapshot, max: Int = 12): List<List<String>> {
+        internal fun categoryCandidates(
+            graph: AppGraph, snapshot: ConversationSnapshot,
+            max: Int = 12, samples: Int = 5
+        ): List<CategoryCandidate> {
             val queryText = snapshot.messages.filter { it.role == "user" }
                 .joinToString(" ") { it.text }.take(500)
-            if (queryText.isBlank()) return fullList(graph)
-            val candidates = LinkedHashMap<String, List<String>>() // pathKey -> path
-            fun addFrom(hits: List<SearchHit>) {
-                for (h in hits) {
-                    if (h.kind != "note") continue
-                    val parts = h.category.split('/').filter { it.isNotBlank() }
-                    if (parts.size in 2..4) candidates.putIfAbsent(parts.joinToString("/"), parts)
-                    if (candidates.size >= max) return
-                }
+            val byCategory = runCatching {
+                graph.search.ensureIndexed(graph.notes, graph.db)
+                graph.search.titlesByCategory()
+            }.getOrDefault(emptyMap())
+            if (queryText.isBlank()) return fullList(graph, byCategory, max, samples)
+            val picked = LinkedHashMap<String, CategoryCandidate>() // key -> candidate
+            fun add(kind: String, pathKey: String, path: List<String>, score: Float, semantic: Boolean) {
+                if (picked.containsKey(pathKey) || path.size !in 2..4) return
+                val titles = byCategory[pathKey]?.take(samples) ?: emptyList()
+                picked[pathKey] = CategoryCandidate(path, titles, score, semantic)
             }
-            // 1) semantic
+            // 1) semantic top-k
             val embed = runCatching { graph.embedApi() }.getOrNull()
             if (embed != null) {
                 runCatching {
                     val vec = embed.embed(listOf(queryText)).first()
-                    graph.search.ensureIndexed(graph.notes, graph.db)
                     val ranked = graph.search.vectorSearch(vec, embed.modelId)
-                    val hits = ranked.mapNotNull { (kind, id, _) ->
-                        graph.search.rawQueryDocument(kind, id)?.let { doc ->
-                            SearchHit(kind, java.io.File(doc.payload), doc.title, doc.category, doc.updatedAt,
-                                doc.title, 0, 0, 0, if (kind == "conv") id else doc.src, "", 0)
-                        }
+                    for ((kind, id, score) in ranked) {
+                        if (picked.size >= max) break
+                        val doc = graph.search.rawQueryDocument(kind, id) ?: continue
+                        if (doc.kind != "note") continue
+                        val parts = doc.category.split('/').filter { it.isNotBlank() }
+                        add(doc.kind, parts.joinToString("/"), parts, score, true)
                     }
-                    addFrom(hits)
                 }
             }
             // 2) keyword fallback / supplement
-            if (candidates.size < max / 2) {
+            if (picked.size < max / 2) {
                 runCatching {
-                    graph.search.ensureIndexed(graph.notes, graph.db)
-                    addFrom(graph.search.query(SearchLogic.terms(queryText).take(4).joinToString(" ")))
+                    val kwQuery = SearchLogic.terms(queryText).take(4).joinToString(" ")
+                    for (hit in graph.search.query(kwQuery)) {
+                        if (picked.size >= max) break
+                        if (hit.kind != "note") continue
+                        val parts = hit.category.split('/').filter { it.isNotBlank() }
+                        add(hit.kind, parts.joinToString("/"), parts, 0f, false)
+                    }
                 }
             }
-            if (candidates.isEmpty()) return fullList(graph)
-            return candidates.values.toList()
+            if (picked.isEmpty()) return fullList(graph, byCategory, max, samples)
+            return picked.values.toList()
         }
-        private fun fullList(graph: AppGraph): List<List<String>> =
-            runCatching { graph.notes.categoryPaths() }.getOrDefault(emptyList()).take(120)
+        private fun fullList(graph: AppGraph, byCategory: Map<String, List<String>>, max: Int, samples: Int): List<CategoryCandidate> =
+            byCategory.entries.take(max).map { (key, titles) ->
+                CategoryCandidate(key.split('/').filter { it.isNotBlank() }, titles.take(samples), 0f, false)
+            }.ifEmpty {
+                runCatching { graph.notes.categoryPaths() }.getOrDefault(emptyList()).take(max)
+                    .map { CategoryCandidate(it, emptyList(), 0f, false) }
+            }
 
         fun enqueue(context: Context, jobId: String) {
             val request = OneTimeWorkRequestBuilder<SummaryWorker>()

@@ -51,3 +51,11 @@ data class ConversationSnapshot(
 
 data class SummaryJob(val id: String, val conversationId: String, val snapshot: String,
     val state: String, val draft: String, val notePath: String, val error: String)
+
+/** One retrieval-selected category candidate handed to the summarizer. */
+data class CategoryCandidate(
+    val path: List<String>,
+    val samples: List<String>,   // representative existing note titles under this path
+    val score: Float,            // retrieval score of the best matching note (0 = keyword fallback)
+    val semantic: Boolean        // true when ranked by embedding similarity
+)

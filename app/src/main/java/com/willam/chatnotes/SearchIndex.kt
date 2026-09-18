@@ -186,6 +186,21 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
                 c.getString(3), c.getString(4) ?: "", c.getString(5) ?: "", c.getString(6) ?: "", c.getLong(7))
         }
 
+    /** Note titles grouped by category path, for category-injection samples. */
+    @Synchronized fun titlesByCategory(limitPerCategory: Int = 8): Map<String, List<String>> {
+        ensureSchema()
+        val out = LinkedHashMap<String, MutableList<String>>()
+        db.rawQuery("SELECT category,title FROM documents WHERE kind='note' ORDER BY updated DESC", null).use { c ->
+            while (c.moveToNext()) {
+                val cat = c.getString(0) ?: ""
+                if (cat.isBlank()) continue
+                val list = out.getOrPut(cat) { mutableListOf() }
+                if (list.size < limitPerCategory) list.add(c.getString(1))
+            }
+        }
+        return out
+    }
+
     private fun semanticHit(key: String, rawQuery: String): SearchHit? {
         val kind = key.substringBefore(':'); val id = key.substringAfter(':')
         return db.rawQuery(
