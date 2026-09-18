@@ -94,7 +94,16 @@
     if (ctx.closed) return false;
     if (!m || !m.id || !m.author || !/^(user|assistant)$/.test(m.author.role)) return false;
     if (m.channel === 'analysis' || (m.metadata && m.metadata.is_visually_hidden_from_conversation)) return false;
+    var ct = m.content && m.content.content_type || '';
+    // Thinking/reasoning containers carry no displayable text and no attachments:
+    // they are NOT "attachments" — emitting a placeholder for them inflates the
+    // capture count (user report: one Q&A counted 3 messages).
+    if (/^(thinking|reasoning|multimodal_thinking|thought|plan)$/i.test(ct)) return false;
     var content = extract(m.content);
+    // An empty non-text container with no real attachment metadata is skipped.
+    if (!content.text.replace(/\[附件或非文本内容未采集.*?\]/g, '').trim() &&
+        !(m.metadata && Array.isArray(m.metadata.attachments) && m.metadata.attachments.length))
+      return false;
     if (m.metadata && Array.isArray(m.metadata.attachments) && m.metadata.attachments.length) {
       content.attachments = true;
       content.text += '\n[附带文件未采集，请在原平台查看]';
@@ -226,6 +235,9 @@
     }
     if (m.author.role !== 'assistant' || m.channel === 'analysis') return;
     if (m.metadata && m.metadata.is_visually_hidden_from_conversation) return;
+    // Thinking/reasoning message frames are valid protocol events, not
+    // "unsupported" — they just carry no text (emit() skips them). Only an
+    // unparsable data frame may degrade the batch to partial.
     var old = ctx.answers[m.id];
     var final = m.status === 'finished_successfully' || m.end_turn === true;
     var item = ctx.answers[m.id] = {message: m, parent: m.parent_id || (old && old.parent) || ctx.parent,
@@ -366,13 +378,14 @@
     try { url = new URL(typeof input === 'string' ? input : input.url || String(input), currentUrl()); }
     catch (_) { return originalFetch(input, init); }
     if (url.origin !== 'https://chatgpt.com') return originalFetch(input, init);
-    var match = url.pathname.match(/^\/backend-api\/(?:f\/)?conversation(?:\/([^/]+))?(?:\/(title))?\/?$/);
+    // Logged-out anonymous chats use /backend-anon/*, logged-in use /backend-api/*.
+    var match = url.pathname.match(/^\/(backend-api|backend-anon)\/(?:f\/)?conversation(?:\/([^/]+))?(?:\/(title))?\/?$/);
     if (!match) return originalFetch(input, init);
     var method = String(init && init.method || input && input.method || 'GET').toUpperCase();
-    var kind = match[2] ? 'title' : method === 'GET' && match[1] ? 'history' : method === 'POST' && !match[1] ? 'send' : '';
+    var kind = match[3] ? 'title' : method === 'GET' && match[2] ? 'history' : method === 'POST' && !match[2] ? 'send' : '';
     if (!kind) return originalFetch(input, init);
     var ctx = {cid: activeId || localId, token: uid('req:'), users: [], answers: Object.create(null),
-      parent: '', time: Date.now(), unknown: 0, historyRequest: latest[match[1] || '']};
+      parent: '', time: Date.now(), unknown: 0, historyRequest: latest[match[2] || '']};
     contexts.push(ctx);
     var prepared = kind === 'send' ? prepare(input, init, ctx) : Promise.resolve();
     function finished() {
@@ -393,7 +406,7 @@
         prepared.then(function () { usersStatus(ctx, 'partial'); finished(); });
         return resp;
       }
-      prepared.then(function () { return observe(copy, ctx, kind, match[1] || ''); })
+      prepared.then(function () { return observe(copy, ctx, kind, match[2] || ''); })
         .catch(function () { flush(ctx, 'partial'); notice('采集未完成，请核对已保存原文。'); })
         .finally(function () { if (copy.body && !copy.body.locked) copy.body.cancel().catch(function () {}); finished(); });
       return resp;

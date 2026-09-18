@@ -144,6 +144,18 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
         // shells (0 messages) were polluting the picker (user report 2026-09-18).
         "SELECT c.id,c.title,c.url,COUNT(m.id),c.updated FROM conversations c JOIN messages m ON m.cid=c.id GROUP BY c.id ORDER BY c.updated DESC", null
     ).use { c -> buildList { while (c.moveToNext()) add(ConversationInfo(c.getString(0), c.getString(1).ifBlank { "未命名会话" }, c.getString(2), c.getInt(3), c.getLong(4))) } }
+    /** Drop placeholder-only messages left by the old thinking-frame bug. */
+    @Synchronized fun prunePlaceholderMessages(): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val deleted = db.delete("messages",
+                "role='assistant' AND TRIM(REPLACE(body,'[附件或非文本内容未采集，请在原平台查看]',''))=''", null)
+            db.setTransactionSuccessful()
+            return deleted
+        } finally { db.endTransaction() }
+    }
+
     /** Drop empty shells (no messages, not referenced by aliases/jobs). */
     @Synchronized fun pruneEmptyConversations(): Int {
         val db = writableDatabase

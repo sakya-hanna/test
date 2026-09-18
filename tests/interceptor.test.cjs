@@ -233,3 +233,30 @@ test('navigation before asynchronous request parsing cannot leave a ghost reques
   assert.equal(sent.filter(e=>e.type==='request').at(-1).state,'end');
   assert.equal(sent.filter(e=>e.type==='message').length,0);
 });
+
+test('anonymous logged-out backend (backend-anon) is captured too',async()=>{
+  const body=sse(message('匿名回复内容','a9','anon1'))+'data: [DONE]\n\n';
+  const {window,sent}=install(async()=>streamed(body));
+  await (await window.fetch('/backend-anon/f/conversation',request(['未登录的问题'],'anon1'))).text();
+  await settle();
+  const msgs=sent.filter(e=>e.type==='message');
+  assert.ok(msgs.some(m=>m.text==='未登录的问题'&&m.role==='user'));
+  assert.ok(msgs.some(m=>m.text==='匿名回复内容'));
+  // request body carries conversation_id, so messages land directly on that cid
+  assert.ok(msgs.every(m=>m.conversationId==='anon1'));
+});
+
+test('thinking frames are not captured as attachment placeholders',async()=>{
+  const thinking={conversation_id:'c1',message:{id:'t1',author:{role:'assistant'},
+    content:{content_type:'thinking',parts:[]},status:'finished_successfully'}};
+  const body=sse(thinking)+sse(message('正文内容','a1'))+'data: [DONE]\n\n';
+  const {window,sent}=install(async()=>streamed(body));
+  await (await window.fetch('/backend-api/conversation',request())).text();await settle();
+  const msgs=sent.filter(e=>e.type==='message');
+  // distinct assistant ids: only the real answer; the thinking frame never emits
+  const ids=new Set(msgs.filter(m=>m.role==='assistant').map(m=>m.msgId));
+  assert.equal(ids.size,1);assert.ok(ids.has('a1'));
+  assert.ok(!msgs.some(m=>m.text.includes('附件或非文本内容未采集')));
+  // clean stream -> complete, not partial
+  assert.equal(finals(sent).at(-1).status,'complete');
+});
