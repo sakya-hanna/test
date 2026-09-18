@@ -44,11 +44,12 @@ class SearchIndexTest {
         File(context.filesDir, indexName).delete()
     }
 
-    @Test fun fts5AvailableOnDevice() {
+    @Test fun fts5ModeIsRecorded() {
         val status = index.status()
-        // Modern devices ship FTS5; if false, LIKE fallback is in use —
-        // the assertion documents the mode for the validation log.
-        assertTrue("FTS5 not available; LIKE fallback in use", status.fts)
+        // Both modes are supported; the assertion would be wrong on OEM builds
+        // that ship SQLite without FTS5 (observed on a Huawei GOA-AL80).
+        // Recall tests below must pass in EITHER mode.
+        android.util.Log.i("SearchIndexTest", "fts=${status.fts}")
     }
 
     @Test fun chineseShortQueryAndErrorCodeRecall() {

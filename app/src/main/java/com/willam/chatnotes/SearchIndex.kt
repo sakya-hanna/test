@@ -103,7 +103,9 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
      */
     @Synchronized fun ensureIndexed(notes: NotesRepo, chat: ChatStore): Status {
         ensureSchema()
-        if (!dirty) return status()
+        // Always run the stamp comparison — it is cheap (mtime/size/updated per row)
+        // and short-circuiting on a "dirty" flag misses writes that happen after
+        // the last sync (found by the on-device incremental sync test).
         val t0 = System.currentTimeMillis()
         // --- notes ---
         val files = notes.allFiles()
