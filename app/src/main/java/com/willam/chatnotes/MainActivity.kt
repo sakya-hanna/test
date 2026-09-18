@@ -255,9 +255,9 @@ class MainActivity : AppCompatActivity() {
         countTask = Runnable {
             countTask = null
             val id = selectedId
-            disk({ if (id.isEmpty()) 0 else graph.db.count(id) }) { count ->
+            disk({ if (id.isEmpty()) 0 else graph.db.rounds(id) }) { count ->
                 if (id == selectedId) {
-                    captureInfo.text = "$captureState · 本次已捕获 $count 条消息"
+                    captureInfo.text = if (count == 0) captureState else "$captureState · 本次已捕获 $count 轮问答"
                     captureInfo.setTextColor(if (captureWarning) Color.rgb(170, 80, 0) else Color.rgb(0, 130, 85))
                 }
             }
@@ -365,7 +365,7 @@ class MainActivity : AppCompatActivity() {
         disk({ graph.db.conversations() }) { conversations ->
             if (conversations.isEmpty()) { toast("尚无已保存的原文"); return@disk }
             AlertDialog.Builder(this).setTitle("已保存对话（含原文）")
-                .setItems(conversations.map { "${it.title} · ${it.count} 条" }.toTypedArray()) { _, i -> showConversation(conversations[i].id) }
+                .setItems(conversations.map { "${it.title} · ${it.count} 轮问答" }.toTypedArray()) { _, i -> showConversation(conversations[i].id) }
                 .setNegativeButton("关闭", null).show()
         }
     }

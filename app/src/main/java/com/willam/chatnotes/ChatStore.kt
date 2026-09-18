@@ -142,7 +142,7 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
     @Synchronized fun conversations(): List<ConversationInfo> = readableDatabase.rawQuery(
         // Only conversations with captured messages are listed; login/navigation
         // shells (0 messages) were polluting the picker (user report 2026-09-18).
-        "SELECT c.id,c.title,c.url,COUNT(m.id),c.updated FROM conversations c JOIN messages m ON m.cid=c.id GROUP BY c.id ORDER BY c.updated DESC", null
+        "SELECT c.id,c.title,c.url,COUNT(m.id),c.updated FROM conversations c JOIN messages m ON m.cid=c.id AND m.status!='failed' AND m.role='user' GROUP BY c.id ORDER BY c.updated DESC", null
     ).use { c -> buildList { while (c.moveToNext()) add(ConversationInfo(c.getString(0), c.getString(1).ifBlank { "未命名会话" }, c.getString(2), c.getInt(3), c.getLong(4))) } }
     /** Drop placeholder-only messages left by the old thinking-frame bug. */
     @Synchronized fun prunePlaceholderMessages(): Int {
@@ -171,6 +171,10 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
     }
     @Synchronized fun count(cid: String): Int = readableDatabase.rawQuery("SELECT COUNT(*) FROM messages WHERE cid=?", arrayOf(resolve(cid)))
         .use { it.moveToFirst(); it.getInt(0) }
+    /** Q&A rounds: each user message with a following assistant reply counts as one round. */
+    @Synchronized fun rounds(cid: String): Int = readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM messages WHERE cid=? AND role='user' AND status!='failed'", arrayOf(resolve(cid))
+    ).use { it.moveToFirst(); it.getInt(0) }
     @Synchronized fun allMessages(cid: String): List<ChatMessage> = readableDatabase.rawQuery(
         "SELECT id,parent,role,body,status,source,attachments,created FROM messages WHERE cid=? ORDER BY created,id", arrayOf(resolve(cid))
     ).use { c -> buildList { while (c.moveToNext()) add(c.message()) } }
