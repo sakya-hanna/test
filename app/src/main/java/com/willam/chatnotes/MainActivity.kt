@@ -224,6 +224,7 @@ class MainActivity : AppCompatActivity() {
             captureState = "收到无法解析的采集数据"; captureWarning = true; refreshCount(); return
         }
         when (j.text("type")) {
+            "__diag" -> { android.util.Log.d("ChatNotes", "fetch ${j.text("method")} ${j.text("path")}"); return }
             "ready" -> { captureState = if (documentStart) "采集中" else "页面补采集模式"; captureWarning = !documentStart; refreshCount() }
             "notice" -> { captureState = j.text("message").take(160); captureWarning = true; refreshCount() }
             "active", "conversation", "message", "remap", "request" -> try {

@@ -260,3 +260,26 @@ test('thinking frames are not captured as attachment placeholders',async()=>{
   // clean stream -> complete, not partial
   assert.equal(finals(sent).at(-1).status,'complete');
 });
+
+test('unauth-mweb form question and HTML-partial reply are captured',async()=>{
+  const form='prompt=' + encodeURIComponent('未登录的问题') +
+    '&conversationState=' + encodeURIComponent(JSON.stringify({conversationId:'anon-9',parentMessageId:'client-created-root'})) +
+    '&chatRequirementsToken=gAAAA';
+  const html='<div>你好，这是<b>回复正文</b>。</div>' +
+    '<div data-prefix="ChatGPT said:">第二条不可见前缀</div>';
+  // Real anonymous sessions live at / (no /c/<id> in the URL), so the context
+  // starts on a local: provisional id and remaps via the form's conversationId.
+  const {window,sent}=install(async()=>new Response(html,{headers:{'content-type':'text/vnd.openai.web-mobile-partial+html'}}),'https://chatgpt.com/');
+  await (await window.fetch('/unauth-mweb/conversation/updates',{
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:form})).text();
+  await settle();
+  const msgs=sent.filter(e=>e.type==='message');
+  // user prompt from the form
+  assert.ok(msgs.some(m=>m.role==='user'&&m.text==='未登录的问题'),'user msg: '+JSON.stringify(msgs));
+  // assistant reply: HTML stripped, text kept
+  assert.ok(msgs.some(m=>m.role==='assistant'&&m.text.includes('回复正文')&&!m.text.includes('<b>')),'assistant msg');
+  // form conversationId binds the context (no stray local: shell messages)
+  assert.ok(msgs.every(m=>m.conversationId==='anon-9'),'cid binding: '+JSON.stringify(msgs.map(m=>m.conversationId)));
+});
