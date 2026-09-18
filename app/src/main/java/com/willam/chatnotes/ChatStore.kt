@@ -203,7 +203,30 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
         val selected = chain.filter { it.status != "failed" }
         check(selected.any { it.role == "assistant" }) { "当前分支还没有可总结的助手回复，请补采集后重试" }
         check(selected.none { it.status in setOf("pending", "streaming") }) { "回复尚未完成，请稍后再总结" }
-        return ConversationSnapshot(cid, meta[0].ifBlank { "未命名会话" }, meta[1], selected, warnings.distinct(), meta[4].toLong())
+        // Incremental summaries: messages already archived by a SAVED job are
+        // excluded, so the next note covers only what is new since then.
+        val covered = summarizedMessageIds(cid)
+        val incremental = selected.filter { it.id !in covered }
+        if (covered.isNotEmpty() && incremental.none { it.role == "user" }) {
+            error("上次归档后没有新的问答，无需重复总结")
+        }
+        val scope = if (covered.isEmpty()) selected else incremental
+        return ConversationSnapshot(cid, meta[0].ifBlank { "未命名会话" }, meta[1], scope, warnings.distinct(), meta[4].toLong())
+    }
+    /** Message IDs already covered by a successfully saved summary job (from snapshots). */
+    private fun summarizedMessageIds(cid: String): Set<String> {
+        val ids = mutableSetOf<String>()
+        val snapshots = mutableListOf<String>()
+        readableDatabase.rawQuery("SELECT snapshot FROM jobs WHERE cid=? AND state='saved'", arrayOf(cid)).use { c ->
+            while (c.moveToNext()) snapshots.add(c.getString(0))
+        }
+        for (raw in snapshots) {
+            runCatching {
+                val a = org.json.JSONObject(raw).optJSONArray("messages") ?: return@runCatching
+                for (i in 0 until a.length()) ids.add(a.getJSONObject(i).getString("id"))
+            }
+        }
+        return ids
     }
     @Synchronized fun createJob(snapshot: ConversationSnapshot, config: ApiConfig? = null): SummaryJob {
         val id = if (config == null) snapshot.fingerprint else sha256(snapshot.fingerprint + "\n" + config.baseUrl + "\n" + config.model)

@@ -94,4 +94,24 @@ class ChatStoreTest {
         store.applyEvent(JSONObject().put("type","conversation").put("conversationId","t1").put("title","向量模型是什么"))
         assertEquals("向量模型是什么", store.conversations().first { it.id == "t1" }.title)
     }
+    @Test fun secondSummaryCoversOnlyNewMessages() {
+        seed("c") // u + a
+        val first = store.snapshot("c")
+        assertEquals(2, first.messages.size)
+        val job = store.createJob(first) // simulate a saved job covering the first Q&A
+        store.updateJob(job.id, "saved")
+        store.applyEvent(JSONObject().put("type","message").put("conversationId","c").put("msgId","u2")
+            .put("parentId","a").put("role","user").put("text","第二个问题").put("status","complete")
+            .put("source","network").put("createdAt",200).put("select",true))
+        store.applyEvent(JSONObject().put("type","message").put("conversationId","c").put("msgId","a2")
+            .put("parentId","u2").put("role","assistant").put("text","第二个回答").put("status","complete")
+            .put("source","network").put("createdAt",300).put("select",true))
+        val second = store.snapshot("c")
+        assertEquals(listOf("u2","a2"), second.messages.map { it.id })
+        // After the second job is saved too, nothing new remains -> explicit refusal
+        val job2 = store.createJob(second)
+        store.updateJob(job2.id, "saved")
+        val third = runCatching { store.snapshot("c") }
+        assertTrue(third.isFailure)
+    }
 }
