@@ -159,38 +159,8 @@
         });
       } catch (_) { notice('提问格式未识别，请核对已保存原文。'); }
     }
-    // unauth-mweb (logged-out) posts urlencoded forms: prompt=...&conversationState=...
-    function parseForm(text) {
-      if (ctx.closed || !text || text.length > MAX_JSON) return;
-      var fields = {};
-      String(text).split('&').forEach(function (pair) {
-        var i = pair.indexOf('=');
-        if (i <= 0) return;
-        try { fields[decodeURIComponent(pair.slice(0, i).replace(/\+/g, '%20'))] =
-          decodeURIComponent(pair.slice(i + 1).replace(/\+/g, '%20')); } catch (_) {}
-      });
-      var prompt = fields.prompt;
-      if (!prompt || !prompt.trim()) { notice('未登录提问内容未能识别，请核对已保存原文。'); return; }
-      var state = {};
-      try { state = JSON.parse(fields.conversationState || '{}'); } catch (_) {}
-      var initialId = ctx.cid;
-      var serverCid = state.conversationId || state.conversation_id || '';
-      if (serverCid) { bind(ctx, serverCid); latest[ctx.cid] = ctx.token; }
-      else if (activeId === initialId) activate(ctx.cid);
-      var user = {id: uid('u:'), author: {role: 'user'}, content: {parts: [prompt]}};
-      ctx.users.push({message: user, parent: ctx.parent});
-      emit(ctx, user, 'pending', 'network', ctx.parent, true);
-    }
     var body = init && init.body;
-    var ct = String(init && init.headers && (init.headers['Content-Type'] || init.headers['content-type']) || '');
-    if (typeof body === 'string') {
-      if (ct.indexOf('application/x-www-form-urlencoded') >= 0) parseForm(body);
-      else parse(body);
-      return Promise.resolve();
-    }
-    if (init && typeof URLSearchParams !== 'undefined' && body && body.constructor && body.constructor.name === 'URLSearchParams') {
-      try { parseForm(body.toString()); return Promise.resolve(); } catch (_) {}
-    }
+    if (typeof body === 'string') { parse(body); return Promise.resolve(); }
     if (!body && input && typeof input.clone === 'function')
       return input.clone().text().then(parse).catch(function () { notice('未能读取本次提问。'); });
     return Promise.resolve();
@@ -400,34 +370,7 @@
         }
         else notice('本次回复不是已支持的流格式，请核对原文或使用页面补采集。');
       }
-      return;
     }
-    // unauth-mweb HTML-partial streams: strip tags, keep the visible text as a
-    // single assistant reply. Best-effort; the raw stream stays on the page.
-    if (ct.indexOf('html') >= 0 && resp.body) return observeHtmlStream(resp, ctx);
-  }
-  async function observeHtmlStream(resp, ctx) {
-    var reader = resp.clone().body.getReader(), decoder = new TextDecoder(), full = '';
-    try {
-      while (true) {
-        var r = await reader.read();
-        if (r.done) break;
-        full += decoder.decode(r.value, {stream: true});
-        if (full.length > MAX_TEXT * 2) { reader.cancel().catch(function () {}); break; }
-      }
-    } catch (_) {}
-    var text = full
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-      .replace(/[ \t]+/g, ' ').trim();
-    if (!text) return;
-    var user = ctx.users.length ? ctx.users[ctx.users.length - 1] : null;
-    var parentId = user ? user.message.id : '';
-    var m = {id: 'html:' + ctx.token, author: {role: 'assistant'}, content: {content_type: 'text', parts: [text.slice(0, MAX_TEXT)]},
-      status: 'complete'};
-    emit(ctx, m, 'complete', 'network', parentId, true);
   }
   var originalFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
@@ -435,30 +378,14 @@
     try { url = new URL(typeof input === 'string' ? input : input.url || String(input), currentUrl()); }
     catch (_) { return originalFetch(input, init); }
     if (url.origin !== 'https://chatgpt.com') return originalFetch(input, init);
-    // Diagnostic log: every same-origin POST/GET that might be a conversation call.
-    // Surfaced as 'notice'-level events only when debug logging is on (see below);
-    // keep it cheap — one send per request, bounded string.
-    var method0 = String(init && init.method || input && input.method || 'GET').toUpperCase();
-    if (url.pathname.indexOf('/conversation') >= 0 || url.pathname.indexOf('backend') >= 0)
-      send({type: '__diag', path: url.pathname.slice(0, 120), method: method0});
-    // Logged-out anonymous chats use /unauth-mweb/*, logged-in use /backend-api/*.
-    // Two path shapes exist: /conversation/<id>/title (logged-in) and
-    // /conversation/<action> (unauth-mweb: updates/prepare). Try id-shape first,
-    // then action-shape, so neither swallows the other.
-    var m1 = url.pathname.match(/^\/(backend-api|backend-anon|unauth-mweb)\/(?:f\/)?conversation(?:\/([^/]+))?(?:\/(title|updates|prepare))?\/?$/);
-    var m2 = url.pathname.match(/^\/(backend-api|backend-anon|unauth-mweb)\/(?:f\/)?conversation\/(title|updates|prepare)\/?$/);
-    var match = m2 || m1; // action-shape wins: /updates must not be read as a conversation id
+    // Logged-out anonymous chats use /backend-anon/*, logged-in use /backend-api/*.
+    var match = url.pathname.match(/^\/(backend-api|backend-anon)\/(?:f\/)?conversation(?:\/([^/]+))?(?:\/(title))?\/?$/);
     if (!match) return originalFetch(input, init);
-    // Normalize: m1=[backend, id, action]; m2=[backend, action].
-    var action = m2 ? m2[2] : (m1 ? m1[3] : '') || '';
-    var convId = m2 ? '' : (m1 ? m1[2] : '') || '';
     var method = String(init && init.method || input && input.method || 'GET').toUpperCase();
-    var kind = action === 'title' ? 'title' : action === 'updates' ? 'send'
-        : method === 'GET' && convId ? 'history' : method === 'POST' && !convId ? 'send' : '';
-    if (action === 'prepare') return originalFetch(input, init); // handshake, no content
+    var kind = match[3] ? 'title' : method === 'GET' && match[2] ? 'history' : method === 'POST' && !match[2] ? 'send' : '';
     if (!kind) return originalFetch(input, init);
     var ctx = {cid: activeId || localId, token: uid('req:'), users: [], answers: Object.create(null),
-      parent: '', time: Date.now(), unknown: 0, historyRequest: latest[convId || '']};
+      parent: '', time: Date.now(), unknown: 0, historyRequest: latest[match[2] || '']};
     contexts.push(ctx);
     var prepared = kind === 'send' ? prepare(input, init, ctx) : Promise.resolve();
     function finished() {
@@ -479,7 +406,7 @@
         prepared.then(function () { usersStatus(ctx, 'partial'); finished(); });
         return resp;
       }
-      prepared.then(function () { return observe(copy, ctx, kind, convId || ''); })
+      prepared.then(function () { return observe(copy, ctx, kind, match[2] || ''); })
         .catch(function () { flush(ctx, 'partial'); notice('采集未完成，请核对已保存原文。'); })
         .finally(function () { if (copy.body && !copy.body.locked) copy.body.cancel().catch(function () {}); finished(); });
       return resp;
@@ -515,27 +442,6 @@
     captureDom: captureDom,
     flush: function () { contexts.forEach(function (ctx) { flush(ctx); }); }
   };
-
-  // ---- XHR diagnostics: unauth-mweb (logged-out frontend) sends its message
-  // stream via XMLHttpRequest, not fetch. Log every XHR to see the real shape.
-  var XHR = window.XMLHttpRequest;
-  if (XHR && XHR.prototype) {
-    var open0 = XHR.prototype.open, send0 = XHR.prototype.send;
-    XHR.prototype.open = function (method, url) {
-      this.__cn_method = String(method || 'GET').toUpperCase();
-      this.__cn_url = String(url || '');
-      return open0.apply(this, arguments);
-    };
-    XHR.prototype.send = function () {
-      try {
-        var u = new URL(this.__cn_url, currentUrl());
-        if (u.origin === 'https://chatgpt.com')
-          send({type: '__diag', path: u.pathname.slice(0, 120) + u.search.slice(0, 60), method: this.__cn_method + '/xhr'});
-      } catch (_) {}
-      return send0.apply(this, arguments);
-    };
-  }
-
   window.addEventListener('pagehide', function () {
     contexts.forEach(function (ctx) {
       flush(ctx, 'partial');
