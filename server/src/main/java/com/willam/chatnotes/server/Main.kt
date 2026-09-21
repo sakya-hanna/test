@@ -21,7 +21,10 @@ import io.ktor.server.auth.Authentication
 import io.ktor.server.auth.Principal
 import io.ktor.server.auth.authenticate
 import io.ktor.server.auth.bearer
+import io.ktor.server.engine.applicationEngineEnvironment
+import io.ktor.server.engine.connector
 import io.ktor.server.engine.embeddedServer
+import io.ktor.server.engine.sslConnector
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.request.receive
@@ -136,8 +139,24 @@ fun main() {
     val token = System.getenv("CHATNOTES_TOKEN")
         ?: File("token.txt").takeIf { it.exists() }?.readText()?.trim().takeUnless { it.isNullOrEmpty() }
         ?: error("CHATNOTES_TOKEN env or token.txt required")
+    val ksPath = System.getenv("CHATNOTES_KEYSTORE")
+    val ksPass = System.getenv("CHATNOTES_KEYSTORE_PASSWORD") ?: "chatnotes"
 
-    embeddedServer(Netty, port = port, host = "0.0.0.0") {
-        syncModule(SyncStore(dbPath), token)
-    }.start(wait = true)
+    val server = embeddedServer(Netty, environment = applicationEngineEnvironment {
+        log = org.slf4j.LoggerFactory.getLogger("chatnotes")
+        module { syncModule(SyncStore(dbPath), token) }
+        if (ksPath != null) {
+            // 生产：PKCS12 证书（gen-certs.sh 产出），Ktor 直接终止 TLS
+            val ks = java.security.KeyStore.getInstance("PKCS12").apply {
+                java.io.FileInputStream(ksPath).use { load(it, ksPass.toCharArray()) }
+            }
+            sslConnector(ks, "chatnotes", { ksPass.toCharArray() }, { ksPass.toCharArray() }) {
+                this.host = "0.0.0.0"; this.port = port
+            }
+        } else {
+            // 开发/本机调试：无证书时退回明文（app 端 usesCleartextTraffic=false 会拒绝，仅限 curl/联调）
+            connector { this.host = "0.0.0.0"; this.port = port }
+        }
+    })
+    server.start(wait = true)
 }

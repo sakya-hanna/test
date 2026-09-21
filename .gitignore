@@ -40,3 +40,4 @@ captures/
 config-backup/
 token.txt
 chatnotes-server.db*
+server/deploy/certs*/

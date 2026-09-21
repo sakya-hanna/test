@@ -34,6 +34,7 @@ dependencies {
     implementation("io.ktor:ktor-server-netty:2.3.12")
     implementation("io.ktor:ktor-server-content-negotiation:2.3.12")
     implementation("io.ktor:ktor-server-auth:2.3.12")
+    implementation("io.ktor:ktor-server-host-common:2.3.12")
     implementation("io.ktor:ktor-serialization-kotlinx-json:2.3.12")
     implementation("org.xerial:sqlite-jdbc:3.46.1.3")
     implementation("org.slf4j:slf4j-nop:2.0.13")
