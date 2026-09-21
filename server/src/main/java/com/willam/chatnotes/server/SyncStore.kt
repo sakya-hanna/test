@@ -158,6 +158,45 @@ class SyncStore(dbUrl: String) : AutoCloseable {
             }
         }
 
+    /** 管理页：列出文档（可选关键词过滤标题/内容），新→旧。 */
+    @Synchronized
+    fun listDocs(query: String, limit: Int = 200): List<DocRow> {
+        val rows = mutableListOf<DocRow>()
+        val hasQ = query.isNotBlank()
+        val sql = buildString {
+            append("SELECT 0, kind, doc_id, category, title, content, updated_at, device_id, content_hash, deleted_at FROM docs")
+            if (hasQ) append(" WHERE title LIKE ? OR content LIKE ?")
+            append(" ORDER BY updated_at DESC LIMIT ?")
+        }
+        conn.prepareStatement(sql).use { ps ->
+            var i = 1
+            if (hasQ) { ps.setString(i, "%$query%"); i++; ps.setString(i, "%$query%") }
+            ps.setInt(i, limit)
+            ps.executeQuery().use { rs ->
+                while (rs.next()) rows.add(rsToRow(rs))
+            }
+        }
+        return rows
+    }
+
+    @Synchronized
+    fun getDoc(kind: String, docId: String): DocRow? {
+        conn.prepareStatement(
+            "SELECT 0, kind, doc_id, category, title, content, updated_at, device_id, content_hash, deleted_at FROM docs WHERE kind=? AND doc_id=?"
+        ).use { ps ->
+            ps.setString(1, kind); ps.setString(2, docId)
+            ps.executeQuery().use { rs -> if (rs.next()) return rsToRow(rs) }
+        }
+        return null
+    }
+
+    private fun rsToRow(rs: java.sql.ResultSet): DocRow = DocRow(
+        seq = rs.getLong(1), kind = rs.getString(2), docId = rs.getString(3),
+        category = rs.getString(4), title = rs.getString(5), content = rs.getString(6),
+        updatedAt = rs.getLong(7), deviceId = rs.getString(8), contentHash = rs.getString(9),
+        deletedAt = rs.getLong(10),
+    )
+
     @Synchronized
     fun touchDevice(deviceId: String, now: Long) {
         conn.prepareStatement(

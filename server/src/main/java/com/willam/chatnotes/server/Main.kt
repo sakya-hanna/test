@@ -29,6 +29,7 @@ import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
@@ -41,6 +42,9 @@ const val PROTOCOL_VERSION = 1
 fun sha256Hex16(content: String): String =
     MessageDigest.getInstance("SHA-256").digest(content.toByteArray(Charsets.UTF_8))
         .joinToString("") { "%02x".format(it) }.take(16)
+
+fun esc(s: String): String = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+fun urlEsc(s: String): String = java.net.URLEncoder.encode(s, "UTF-8")
 
 /** 鉴权通过后的 principal 占位；token 本身校验见 bearer validate */
 object TokenPrincipal : Principal
@@ -63,6 +67,47 @@ fun Application.syncModule(store: SyncStore, token: String) {
     routing {
         get("/health") {
             call.respond(mapOf("ok" to true))
+        }
+
+        // 极简管理页（只读）：文档列表 + 按标题/内容搜索。P1 最小实现，无 JS 无外部资源。
+        get("/admin") {
+            val q = call.request.queryParameters["q"].orEmpty().trim()
+            val docs = store.listDocs(q, limit = 200)
+            val rows = docs.joinToString("") { d ->
+                val del = if (d.deletedAt > 0) " <span style='color:#b00'>[已删]</span>" else ""
+                "<tr><td>${esc(d.kind)}</td><td><a href='/admin/doc?kind=${d.kind}&id=${urlEsc(d.docId)}'>${esc(d.title.ifBlank { d.docId.take(12) })}</a>$del</td>" +
+                    "<td>${esc(d.category)}</td><td>${esc(d.deviceId)}</td><td>${d.updatedAt}</td></tr>"
+            }
+            val html = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<title>ChatNotes 后台</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:system-ui,sans-serif;margin:24px;max-width:960px}table{border-collapse:collapse;width:100%}
+td,th{border:1px solid #ddd;padding:6px 10px;text-align:left;font-size:14px}th{background:#f5f5f5}
+input{padding:6px;width:60%}button{padding:6px 14px}.m{color:#888;font-size:12px}</style></head><body>
+<h2>ChatNotes 后台（只读）</h2>
+<p class="m">共 ${store.docCount()} 篇有效文档</p>
+<form method="get" action="/admin"><input name="q" value="${esc(q)}" placeholder="搜索标题/内容…"><button>搜索</button></form>
+<table><tr><th>类型</th><th>标题</th><th>分类</th><th>设备</th><th>更新时间</th></tr>$rows</table>
+</body></html>"""
+            call.respondText(html, io.ktor.http.ContentType.Text.Html)
+        }
+
+        get("/admin/doc") {
+            val kind = call.request.queryParameters["kind"].orEmpty()
+            val id = call.request.queryParameters["id"].orEmpty()
+            val d = store.getDoc(kind, id)
+            if (d == null) call.respond(HttpStatusCode.NotFound, "未找到文档")
+            else {
+                val html = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>${esc(d.title)}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:system-ui,sans-serif;margin:24px;max-width:820px}pre{white-space:pre-wrap;word-break:break-word;background:#f8f8f8;padding:16px;border-radius:6px}
+.m{color:#888;font-size:12px}</style></head><body>
+<p><a href="/admin">← 返回列表</a></p>
+<h2>${esc(d.title.ifBlank { "(无标题)" })}</h2>
+<p class="m">${esc(d.kind)} · ${esc(d.category)} · 设备 ${esc(d.deviceId)} · updated=${d.updatedAt}${if (d.deletedAt > 0) " · <b style='color:#b00'>已删除</b>" else ""}</p>
+<pre>${esc(d.content.ifBlank { "（内容为空——可能是墓碑记录）" })}</pre>
+</body></html>"""
+                call.respondText(html, io.ktor.http.ContentType.Text.Html)
+            }
         }
 
         authenticate("chatnotes") {

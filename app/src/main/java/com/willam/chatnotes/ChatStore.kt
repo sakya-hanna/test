@@ -228,8 +228,9 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
         }
         return ids
     }
-    @Synchronized fun createJob(snapshot: ConversationSnapshot, config: ApiConfig? = null): SummaryJob {
-        val id = if (config == null) snapshot.fingerprint else sha256(snapshot.fingerprint + "\n" + config.baseUrl + "\n" + config.model)
+    @Synchronized fun createJob(snapshot: ConversationSnapshot, config: ApiConfig? = null, forceNew: Boolean = false): SummaryJob {
+        val id = if (forceNew) sha256(snapshot.fingerprint + "\n" + System.currentTimeMillis())
+        else if (config == null) snapshot.fingerprint else sha256(snapshot.fingerprint + "\n" + config.baseUrl + "\n" + config.model)
         val input = snapshot.json()
         if (config != null) input.put("api_base", config.baseUrl).put("api_model", config.model)
         val values = ContentValues().apply {

@@ -570,11 +570,25 @@ class MainActivity : AppCompatActivity() {
             AlertDialog.Builder(this).setTitle("整理任务")
                 .setItems(jobs.map { "${labels[it.state] ?: it.state} · ${runCatching { JSONObject(it.snapshot).text("title") }.getOrDefault("会话")}" }.toTypedArray()) { _, index ->
                     val job = jobs[index]
-                    if (job.state == "saved") { switchTab(false); render() }
-                    else AlertDialog.Builder(this).setTitle(labels[job.state]).setMessage(job.error.ifBlank { "已保存原文与处理进度，可离开页面。" })
-                        .setPositiveButton("继续 / 重试") { _, _ ->
-                            disk({ graph.config.read(); graph.db.updateJob(job.id, "queued"); SummaryWorker.enqueue(graph.app, job.id) }) { toast("任务已提交") }
-                        }.setNegativeButton("关闭", null).show()
+                    when {
+                        job.state == "saved" -> AlertDialog.Builder(this).setTitle("已归档")
+                            .setMessage("这份原文快照已整理成笔记。可以基于同一份原文重新整理为一份新笔记（原笔记保留）。")
+                            .setPositiveButton("重新整理") { _, _ ->
+                                disk({
+                                    graph.config.read()
+                                    val snapshot = ConversationSnapshot.from(JSONObject(job.snapshot))
+                                    val newJob = graph.db.createJob(snapshot, forceNew = true)
+                                    graph.db.updateJob(newJob.id, "queued")
+                                    SummaryWorker.enqueue(graph.app, newJob.id)
+                                }, { toast("已加入整理任务，完成后生成新笔记") })
+                            }
+                            .setNeutralButton("查看笔记") { _, _ -> switchTab(false); render() }
+                            .setNegativeButton("关闭", null).show()
+                        else -> AlertDialog.Builder(this).setTitle(labels[job.state]).setMessage(job.error.ifBlank { "已保存原文与处理进度，可离开页面。" })
+                            .setPositiveButton("继续 / 重试") { _, _ ->
+                                disk({ graph.config.read(); graph.db.updateJob(job.id, "queued"); SummaryWorker.enqueue(graph.app, job.id) }) { toast("任务已提交") }
+                            }.setNegativeButton("关闭", null).show()
+                    }
                 }.setNegativeButton("关闭", null).show()
         }
     }
@@ -671,6 +685,7 @@ class MainActivity : AppCompatActivity() {
                             if (n.isFolder) { folders.add(n.name); renderLimit = 200; render() }
                             else disk({ graph.notes.readNote(n.file) }) { markdown ->
                                 markwon.setMarkdown(detailBody, markdown); scrollView.visibility = View.GONE; detailScroll.visibility = View.VISIBLE
+                                setupSourceJump(n.file)
                             }
                         }
                         if (!n.isFolder) row.setOnLongClickListener { showNoteActions(n.file); true }
@@ -751,6 +766,7 @@ class MainActivity : AppCompatActivity() {
                 "note" -> disk({ runCatching { graph.notes.readNote(hit.file) } }) { result ->
                     result.fold({ markdown ->
                         markwon.setMarkdown(detailBody, markdown); scrollView.visibility = View.GONE; detailScroll.visibility = View.VISIBLE
+                        setupSourceJump(hit.file)
                     }, { toast("笔记文件已被移动或删除，可重建索引") })
                 }
                 "conv" -> showConversation(hit.conversationId)
@@ -760,6 +776,18 @@ class MainActivity : AppCompatActivity() {
         return card
     }
     fun onBackFromDetail(view: View) { detailScroll.visibility = View.GONE; scrollView.visibility = View.VISIBLE }
+
+    /** 笔记详情页顶部挂"查看来源对话"入口（从 jobs.notePath 反查会话）。 */
+    private fun setupSourceJump(file: File) {
+        diskOnce({ graph.db.jobs().firstOrNull { it.notePath == file.canonicalPath }?.conversationId }) { cid ->
+            captureInfo.setOnClickListener {
+                if (webViewDestroyed) showRendererRecovery()
+                else if (!cid.isNullOrEmpty()) showConversation(cid)
+                else toast("这份笔记没有关联的已采集对话")
+            }
+        }
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
