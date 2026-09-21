@@ -254,7 +254,81 @@
       status: final ? 'complete' : 'streaming', sentAt: old ? old.sentAt : 0};
     if (final || !old || Date.now() - item.sentAt >= 400) publish(ctx, item, item.status);
   }
-  // ---- DeepSeek: NDJSON fragment stream (response is a JSON-lines chunk sequence) ----
+  // ---- DeepSeek: XHR + NDJSON fragment stream ----
+  // The DeepSeek web app sends chat requests via XMLHttpRequest (not fetch), so we
+  // wrap XMLHttpRequest.send/open. Response is a JSON-lines chunk sequence.
+  var originalOpen = XMLHttpRequest.prototype.open;
+  var originalSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__cnUrl = String(url || '');
+    return originalOpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function (body) {
+    var xhr = this;
+    var isCompletion = false;
+    try {
+      var u = new URL(xhr.__cnUrl, currentUrl());
+      isCompletion = u.origin === 'https://chat.deepseek.com' &&
+        /^\/api\/v0\/chat\/completion/.test(u.pathname) &&
+        String(xhr.__cnMethod || 'POST').toUpperCase() !== 'GET';
+    } catch (_) { isCompletion = false; }
+    if (!isCompletion) return originalSend.apply(this, arguments);
+    var dctx = {cid: activeId || localId, token: uid('req:'), users: [], answers: Object.create(null),
+      parent: '', time: Date.now(), unknown: 0};
+    contexts.push(dctx);
+    send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'start'});
+    // 提问内容：请求体里带 messages（用户消息在最后），先解析出 user 消息。
+    function prepareUsers() {
+      try {
+        if (!body) return;
+        var j = typeof body === 'string' ? JSON.parse(body) : null;
+        if (!j) return;
+        var msgs = j.messages || (j.body && j.body.messages) || [];
+        msgs.forEach(function (m) {
+          if ((m.role || '') !== 'user') return;
+          var t = deepseekText(m.content);
+          if (!t.trim()) return;
+          var user = {id: uid('request:'), author: {role: 'user'}, content: {parts: [t]}};
+          dctx.users.push({message: user, parent: ''});
+          emit(dctx, user, 'pending', 'network', '', true);
+        });
+      } catch (_) { /* 请求体格式变化时静默，DOM 兜底 */ }
+    }
+    xhr.addEventListener('load', function () {
+      try {
+        var text = String(xhr.responseText || '');
+        if (!text) { usersStatus(dctx, 'failed'); return; }
+        usersStatus(dctx, 'complete');
+        // NDJSON 或整体 JSON 都试解
+        var frags = [];
+        try {
+          text.split('\n').forEach(function (line) {
+            line = line.trim();
+            if (!line || line === '[DONE]') return;
+            if (line.indexOf('data:') === 0) line = line.slice(5).replace(/^\s/, '');
+            frags.push(JSON.parse(line));
+          });
+        } catch (_) {
+          try { frags = [JSON.parse(text)]; } catch (_e) { dctx.unknown++; }
+        }
+        frags.forEach(function (frag) { deepseekApply(dctx, frag); });
+        flush(dctx, dctx.unsupported ? 'partial' : 'complete');
+        if (!Object.keys(dctx.answers).length) {
+          notice('回复未从网络捕获，已用页面补采集核对。');
+          captureDom();
+        }
+      } catch (_) { flush(dctx, 'partial'); notice('回复采集出错，已保存收到的内容。'); }
+    });
+    xhr.addEventListener('error', function () { usersStatus(dctx, 'failed'); });
+    var done = function () {
+      send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'end'});
+      var i = contexts.indexOf(dctx); if (i >= 0) contexts.splice(i, 1);
+    };
+    xhr.addEventListener('loadend', done);
+    prepareUsers();
+    send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'start'});
+    return originalSend.apply(this, arguments);
+  };
   function deepseekText(obj) {
     // Accept string content or {text: "..."} / {content: "..."} shapes seen in fragments.
     if (!obj) return '';
@@ -289,67 +363,6 @@
     if (fin) st.final = true;
     if (st.final || Date.now() - st.sentAt >= 400) {
       deepseekEmit(ctx, st); st.sentAt = Date.now();
-    }
-  }
-  async function observeDeepseek(resp, ctx) {
-    if (!resp.ok) { usersStatus(ctx, 'failed'); return; }
-    var ct = resp.headers.get('content-type') || '';
-    var reader = resp.body ? resp.body.getReader() : null;
-    var decoder = new TextDecoder(), buffer = '', bytes = 0;
-    var timer = setTimeout(function () { reader && reader.cancel().catch(function () {}); }, 240000);
-    try {
-      if (ct.indexOf('json') >= 0 || ct.indexOf('event-stream') < 0 && !reader) {
-        // Single JSON body (non-streamed or whole response)
-        var text = '';
-        if (reader) {
-          while (true) {
-            var r = await reader.read();
-            if (r.done) break;
-            bytes += r.value.byteLength;
-            if (bytes > MAX_STREAM) throw new Error('limit');
-            text += decoder.decode(r.value, {stream: true});
-          }
-          text += decoder.decode();
-        }
-        var head = text.slice(0, 1);
-        if (head === '[' || head === '{') {
-          try {
-            var whole = JSON.parse(text);
-            (Array.isArray(whole) ? whole : [whole]).forEach(function (frag) { deepseekApply(ctx, frag); });
-          } catch (_) { ctx.unknown++; }
-        }
-      } else if (reader) {
-        // NDJSON lines
-        while (true) {
-          var chunk = await reader.read();
-          if (chunk.done) break;
-          bytes += chunk.value.byteLength;
-          if (bytes > MAX_STREAM) throw new Error('limit');
-          buffer += decoder.decode(chunk.value, {stream: true});
-          var i;
-          while ((i = buffer.indexOf('\n')) >= 0) {
-            var line = buffer.slice(0, i).replace(/\r$/, ''); buffer = buffer.slice(i + 1);
-            if (!line.trim() || line.trim() === '[DONE]') continue;
-            if (line.indexOf('data:') === 0) line = line.slice(5).replace(/^\s/, '');
-            try { deepseekApply(ctx, JSON.parse(line)); }
-            catch (_) { ctx.unknown++; ctx.unsupported = true; }
-          }
-        }
-        if (buffer.trim() && buffer.trim() !== '[DONE]') {
-          try { deepseekApply(ctx, JSON.parse(buffer.trim())); } catch (_) { ctx.unknown++; }
-        }
-      }
-      flush(ctx, ctx.unsupported ? 'partial' : 'complete');
-      if (ctx.unsupported || !Object.keys(ctx.answers).length) {
-        notice(ctx.unsupported ? '回复协议未识别，已保存部分内容，请用页面补采集核对。' : '本次回复未捕获到内容，请用页面补采集。');
-        captureDom();
-      }
-    } catch (_) {
-      flush(ctx, 'partial');
-      notice('回复采集中断，已保存收到的内容，可重新加载会话补采集。');
-    } finally {
-      clearTimeout(timer);
-      if (reader) { reader.cancel().catch(function () {}); reader.releaseLock(); }
     }
   }
   async function observeStream(resp, ctx) {
@@ -485,38 +498,8 @@
     var url;
     try { url = new URL(typeof input === 'string' ? input : input.url || String(input), currentUrl()); }
     catch (_) { return originalFetch(input, init); }
-    if (PLATFORM === 'deepseek') {
-      if (url.origin !== 'https://chat.deepseek.com') return originalFetch(input, init);
-      // DeepSeek web app: POST /api/v0/chat/completion streams NDJSON fragments.
-      if (!/^\/api\/v0\/chat\/completion/.test(url.pathname) || String(init && init.method || 'POST').toUpperCase() !== 'POST')
-        return originalFetch(input, init);
-      var dctx = {cid: activeId || localId, token: uid('req:'), users: [], answers: Object.create(null),
-        parent: '', time: Date.now(), unknown: 0};
-      contexts.push(dctx);
-      send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'start'});
-      var df;
-      try { df = originalFetch(input, init); }
-      catch (e) { usersStatus(dctx, 'failed'); dctx.closed = true; var i0 = contexts.indexOf(dctx); if (i0 >= 0) contexts.splice(i0, 1); throw e; }
-      return df.then(function (resp) {
-        var copy;
-        try { copy = resp.clone(); }
-        catch (_) { notice('无法复制响应，网页仍可使用；请核对采集结果。'); usersStatus(dctx, 'partial'); return resp; }
-        observeDeepseek(copy, dctx).catch(function () { flush(dctx, 'partial'); notice('采集未完成，请核对已保存原文。'); })
-          .finally(function () {
-            send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'end'});
-            if (copy.body && !copy.body.locked) copy.body.cancel().catch(function () {});
-            var i = contexts.indexOf(dctx); if (i >= 0) contexts.splice(i, 1);
-          });
-        return resp;
-      }, function (err) {
-        usersStatus(dctx, 'failed');
-        send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'end'});
-        var j = contexts.indexOf(dctx); if (j >= 0) contexts.splice(j, 1);
-        throw err;
-      });
-    }
     if (url.origin !== 'https://chatgpt.com') return originalFetch(input, init);
-    // Logged-out anonymous chats use /backend-anon/*, logged-in use /backend-api/*.
+    // ChatGPT: logged-out anonymous chats use /backend-anon/*, logged-in use /backend-api/*.
     var match = url.pathname.match(/^\/(backend-api|backend-anon)\/(?:f\/)?conversation(?:\/([^/]+))?(?:\/(title))?\/?$/);
     if (!match) return originalFetch(input, init);
     var method = String(init && init.method || input && input.method || 'GET').toUpperCase();
@@ -558,17 +541,15 @@
     var cid = routeId() || activeId || localId;
     var count = 0, parent = '';
     if (PLATFORM === 'deepseek') {
-      // DeepSeek DOM: message blocks live in the chat scroll area; role is inferred
-      // from the container classes since there are no data-message-* attributes.
-      // IDs are positional (chat id + index) so repeated补采集 dedupes safely.
-      var blocks = window.document.querySelectorAll(
-        'div[class*="ds-markdown"], div[class*="message-item"], div[class*="chat-message"]');
+      // DeepSeek DOM: .ds-message containers; assistant messages contain a
+      // .ds-markdown block, user messages do not. IDs are content-keyed so
+      // repeated补采集 dedupes safely.
+      var blocks = window.document.querySelectorAll('.ds-message');
       var seen = window.__chatnotesDsDom = window.__chatnotesDsDom || Object.create(null);
       Array.prototype.forEach.call(blocks, function (node) {
+        var isUser = !node.querySelector('[class*="ds-markdown"]');
         var text = String(node.innerText || '').trim();
         if (!text || text.length < 2) return;
-        var isUser = /(_user|user-message|human)/i.test(node.className) ||
-          (node.closest('div[class*="request"]') != null);
         var key = (isUser ? 'u' : 'a') + ':' + text.slice(0, 80);
         var id = seen[key];
         if (!id) { id = seen[key] = 'dsdom-' + (Object.keys(seen).length + 1) + '-' + cid.slice(0, 8); }
