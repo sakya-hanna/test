@@ -83,8 +83,17 @@ class NoteOps(private val root: File) {
         val rootPath = root.canonicalPath
         while (d.canonicalPath != rootPath && d.canonicalPath.startsWith(rootPath)) {
             if (!d.isDirectory || d.list()?.isNotEmpty() == true) break
+            val parent = d.parentFile
             if (!d.delete()) break
-            d = d.parentFile ?: break
+            d = parent
         }
     }
+
+    /** 供 NoteAdmin 回收站移动后清理空目录。 */
+    fun cleanupEmptyDirsPublic(dir: File?) = cleanupEmptyDirs(dir)
+
+    /** 笔记是否位于回收站目录内。 */
+    fun inTrash(file: File): Boolean =
+        file.canonicalPath.startsWith(File(root, NoteAdmin.TRASH_DIR).canonicalPath)
 }
+

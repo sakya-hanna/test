@@ -311,7 +311,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
     private fun showMenu() {
-        val actions = arrayOf("LLM 接口设置", "向量检索设置", "后台同步设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "重建语义索引", "导出原文与笔记 ZIP")
+        val actions = arrayOf("LLM 接口设置", "向量检索设置", "后台同步设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "重建语义索引", "回收站", "导出原文与笔记 ZIP")
         AlertDialog.Builder(this).setTitle("ChatNotes").setItems(actions) { _, index ->
             when (index) {
                 0 -> showSettings()
@@ -333,7 +333,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 7 -> rebuildSemanticIndex()
-                8 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
+                8 -> showTrash()
+                9 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
             }
         }.show()
     }
@@ -420,14 +421,21 @@ class MainActivity : AppCompatActivity() {
     /** 笔记长按菜单。所有操作完成后：刷新索引 + 触发同步（编辑/移动产生新版本，删除产生墓碑）。 */
     private fun showNoteActions(file: File) {
         val ops = NoteOps(graph.notes.root)
+        val admin = NoteAdmin(graph.notes.root, graph.config)
         val meta = diskOnce { ops.metaOf(file) } ?: run { toast("不是可管理的笔记文件"); return }
-        val actions = arrayOf("编辑内容", "重命名", "移动分类", "删除")
+        val actions = if (admin.isPinned(meta.id))
+            arrayOf("编辑内容", "重命名", "移动分类", "取消收藏", "删除")
+        else arrayOf("编辑内容", "重命名", "移动分类", "收藏置顶", "删除")
         AlertDialog.Builder(this).setTitle(meta.title).setItems(actions) { _, i ->
             when (i) {
                 0 -> editNoteDialog(ops, meta)
                 1 -> renameNoteDialog(ops, meta)
                 2 -> moveNoteDialog(ops, meta)
-                3 -> deleteNoteConfirm(ops, meta)
+                3 -> {
+                    if (admin.isPinned(meta.id)) admin.unpin(meta.id) else admin.pin(meta.id)
+                    render(); toast(if (admin.isPinned(meta.id)) "已收藏，显示在列表顶部" else "已取消收藏")
+                }
+                4 -> deleteNoteConfirm(ops, admin, meta)
             }
         }.show()
     }
@@ -495,20 +503,52 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("取消", null).show()
     }
 
-    private fun deleteNoteConfirm(ops: NoteOps, meta: NoteOps.Meta) {
+    private fun deleteNoteConfirm(ops: NoteOps, admin: NoteAdmin, meta: NoteOps.Meta) {
         AlertDialog.Builder(this).setTitle("删除笔记")
-            .setMessage("「${meta.title}」将被删除。已同步到后台的副本会一并标记删除；此操作不可撤销。")
+            .setMessage("「${meta.title}」将移入回收站，并从其他设备删除；可在 设置→回收站 中恢复或彻底清除。")
             .setPositiveButton("删除") { _, _ ->
                 disk({
-                    ops.delete(meta)
-                    graph.search.ensureIndexed(graph.notes, graph.db) // 孤儿清理：索引/向量同步移除
+                    if (ops.inTrash(meta.file)) ops.delete(meta) else admin.trash(meta)
+                    graph.search.ensureIndexed(graph.notes, graph.db) // 索引/向量同步移除
                 }, {
-                    toast("已删除")
+                    toast("已移入回收站")
                     SyncWorker.enqueueAfterNoteChange(applicationContext) // planDeletes 广播墓碑
                     render()
                 })
             }
             .setNegativeButton("取消", null).show()
+    }
+
+    /** 回收站管理：恢复 / 彻底删除 / 清空。 */
+    private fun showTrash() {
+        val admin = NoteAdmin(graph.notes.root, graph.config)
+        diskOnce({ admin.trashItems() }) { items ->
+            if (items.isEmpty()) { toast("回收站是空的"); return@diskOnce }
+            val labels = items.map { (m, origin) -> "${m.title}（原：$origin）" }.toTypedArray()
+            AlertDialog.Builder(this).setTitle("回收站（${items.size}）")
+                .setItems(labels) { _, i ->
+                    val (meta, _) = items[i]
+                    AlertDialog.Builder(this).setTitle(meta.title)
+                        .setPositiveButton("恢复到原位置") { _, _ ->
+                            disk({
+                                val dest = admin.restore(meta)
+                                graph.search.ensureIndexed(graph.notes, graph.db)
+                                dest
+                            }, { toast("已恢复"); render() })
+                        }
+                        .setNeutralButton("彻底删除") { _, _ ->
+                            disk({
+                                NoteOps(graph.notes.root).delete(meta)
+                                graph.search.ensureIndexed(graph.notes, graph.db)
+                            }, { toast("已彻底删除"); showTrash() })
+                        }
+                        .setNegativeButton("返回", null).show()
+                }
+                .setNeutralButton("清空回收站") { _, _ ->
+                    disk({ admin.emptyTrash(); graph.search.ensureIndexed(graph.notes, graph.db) }, { toast("已清空"); render() })
+                }
+                .setNegativeButton("关闭", null).show()
+        }
     }
 
     /** 同步一次性后台任务（不走渲染队列，避免打断列表）。带回调版。 */
@@ -646,8 +686,13 @@ class MainActivity : AppCompatActivity() {
                 // Hybrid search: keyword + semantic (RRF), degrades to keyword offline.
                 graph.search.ensureIndexed(graph.notes, graph.db)
                 graph.search.hybridQuery(query, graph.embedApi()).map { it to "" }
-            } else current.children
-                .sortedWith(compareByDescending<NotesRepo.Node> { it.isFolder }.thenByDescending { it.file.lastModified() }).map { it to "" }
+            } else {
+                val admin = NoteAdmin(graph.notes.root, graph.config)
+                current.children
+                    .sortedWith(compareByDescending<NotesRepo.Node> { !it.isFolder && admin.isPinned(it.id ?: "") }
+                        .thenByDescending { it.isFolder }.thenByDescending { it.file.lastModified() })
+                    .map { it to "" }
+            }
             actual to rows
         }) { (actual, rows) ->
             if (generation != renderGeneration) return@query

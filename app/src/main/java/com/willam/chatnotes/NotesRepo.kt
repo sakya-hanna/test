@@ -12,6 +12,9 @@ class NotesRepo(context: Context, dirName: String = "notes") {
     data class Node(val name: String, val isFolder: Boolean, val file: File) {
         var date: String = ""
         var children: MutableList<Node> = mutableListOf()
+        /** 笔记节点的 jobId（文件名尾部 64hex），文件夹为 null。 */
+        val id: String? get() = if (isFolder) null
+            else Regex("--([a-f0-9]{64})$").find(file.nameWithoutExtension)?.groupValues?.get(1)
     }
     private fun node(f: File): Node = Node(
         if (f.isDirectory) f.name else f.nameWithoutExtension.replace(Regex("--[a-f0-9]{64}$"), ""), f.isDirectory, f
@@ -24,6 +27,8 @@ class NotesRepo(context: Context, dirName: String = "notes") {
             if (depth > 16 || !seen.add(dir.canonicalPath)) return n
             dir.listFiles()?.sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name })?.forEach {
                 val safe = runCatching { files.contained(it) }.getOrNull() ?: return@forEach
+                // 回收站目录不在知识库树中渲染（经 设置→回收站 管理）
+                if (it.name == NoteAdmin.TRASH_DIR) return@forEach
                 if (safe.isDirectory) n.children.add(load(safe, depth + 1))
                 else if (safe.extension == "md") n.children.add(node(safe))
             }
