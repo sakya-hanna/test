@@ -47,7 +47,7 @@ private fun withApp(block: suspend ApplicationTestBuilder.(String, HttpClient) -
             config = ApplicationConfig("empty")
         }
         application {
-            syncModule(SyncStore(db.absolutePath), TOKEN)
+            syncModule(SyncStore("jdbc:sqlite:" + db.absolutePath), TOKEN)
         }
         val client = createClient { }
         block(TOKEN, client)

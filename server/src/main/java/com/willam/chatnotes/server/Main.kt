@@ -135,7 +135,8 @@ fun Application.syncModule(store: SyncStore, token: String) {
 
 fun main() {
     val port = System.getenv("CHATNOTES_PORT")?.toIntOrNull() ?: 8443
-    val dbPath = System.getenv("CHATNOTES_DB") ?: "./chatnotes-server.db"
+    val dbUrl = System.getenv("CHATNOTES_DB_URL")
+        ?: "jdbc:sqlite:" + (System.getenv("CHATNOTES_DB") ?: "./chatnotes-server.db")
     val token = System.getenv("CHATNOTES_TOKEN")
         ?: File("token.txt").takeIf { it.exists() }?.readText()?.trim().takeUnless { it.isNullOrEmpty() }
         ?: error("CHATNOTES_TOKEN env or token.txt required")
@@ -144,7 +145,7 @@ fun main() {
 
     val server = embeddedServer(Netty, environment = applicationEngineEnvironment {
         log = org.slf4j.LoggerFactory.getLogger("chatnotes")
-        module { syncModule(SyncStore(dbPath), token) }
+        module { syncModule(SyncStore(dbUrl), token) }
         if (ksPath != null) {
             // 生产：PKCS12 证书（gen-certs.sh 产出），Ktor 直接终止 TLS
             val ks = java.security.KeyStore.getInstance("PKCS12").apply {

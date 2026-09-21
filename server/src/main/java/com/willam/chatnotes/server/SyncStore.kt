@@ -4,20 +4,36 @@ import java.sql.Connection
 import java.sql.DriverManager
 
 /**
- * 服务器存储：SQLite 单文件，嵌入运行（无独立 DB 进程）。
+ * 服务器存储：SQLite（嵌入，默认）或 PostgreSQL（外部实例）。
  * 表：
  *   docs      文档主表（note/summary_part/conv），content_hash 幂等，soft deleted_at
  *   changes   变更日志（单调递增 seq），Pull 光标即此 seq
  *   devices   设备注册与心跳
+ *
+ * @param dbUrl jdbc:sqlite:/path/x.db 或 jdbc:postgresql://host:port/db?user=&password=
  */
-class SyncStore(dbPath: String) : AutoCloseable {
+class SyncStore(dbUrl: String) : AutoCloseable {
 
-    private val conn: Connection = DriverManager.getConnection("jdbc:sqlite:$dbPath")
+    private val isPg = dbUrl.startsWith("jdbc:postgresql")
+
+    init {
+        // fat jar 合并 service 文件时 PG 驱动注册可能被覆盖，显式加载兜底
+        if (isPg) Class.forName("org.postgresql.Driver")
+    }
+
+    private val conn: Connection = DriverManager.getConnection(dbUrl).apply {
+        autoCommit = true
+    }
+
+    /** 方言差异：自增主键 DDL；PG 的 BIGSERED 已是 64 位 */
+    private val autoIncPk = if (isPg) "BIGSERIAL PRIMARY KEY" else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
     init {
         conn.createStatement().use { st ->
-            st.execute("PRAGMA journal_mode=WAL")
-            st.execute("PRAGMA synchronous=NORMAL")
+            if (!isPg) {
+                st.execute("PRAGMA journal_mode=WAL")
+                st.execute("PRAGMA synchronous=NORMAL")
+            }
             st.execute(
                 """CREATE TABLE IF NOT EXISTS docs(
                 kind TEXT NOT NULL,
@@ -25,16 +41,16 @@ class SyncStore(dbPath: String) : AutoCloseable {
                 category TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL DEFAULT '',
                 content TEXT NOT NULL DEFAULT '',
-                updated_at INTEGER NOT NULL,
+                updated_at BIGINT NOT NULL,
                 device_id TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
-                deleted_at INTEGER NOT NULL DEFAULT 0,
+                deleted_at BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY(kind, doc_id)
             )"""
             )
             st.execute(
                 """CREATE TABLE IF NOT EXISTS changes(
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                seq $autoIncPk,
                 kind TEXT NOT NULL,
                 doc_id TEXT NOT NULL,
                 deleted INTEGER NOT NULL DEFAULT 0
@@ -43,8 +59,8 @@ class SyncStore(dbPath: String) : AutoCloseable {
             st.execute(
                 """CREATE TABLE IF NOT EXISTS devices(
                 device_id TEXT PRIMARY KEY,
-                first_seen INTEGER NOT NULL,
-                last_seen INTEGER NOT NULL
+                first_seen BIGINT NOT NULL,
+                last_seen BIGINT NOT NULL
             )"""
             )
         }
@@ -61,14 +77,31 @@ class SyncStore(dbPath: String) : AutoCloseable {
             if (existing.contentHash == contentHash) return "same"
             if (existing.updatedAt >= updatedAt) return "older"
         }
-        conn.prepareStatement(
-            """INSERT OR REPLACE INTO docs(kind,doc_id,category,title,content,updated_at,device_id,content_hash,deleted_at)
-               VALUES(?,?,?,?,?,?,?,?,0)"""
-        ).use { ps ->
-            ps.setString(1, kind); ps.setString(2, docId); ps.setString(3, category)
-            ps.setString(4, title); ps.setString(5, content); ps.setLong(6, updatedAt)
-            ps.setString(7, deviceId); ps.setString(8, contentHash)
-            ps.executeUpdate()
+        // 方言分支：SQLite 用 INSERT OR REPLACE；PG 用 ON CONFLICT DO UPDATE
+        if (isPg) {
+            conn.prepareStatement(
+                """INSERT INTO docs(kind,doc_id,category,title,content,updated_at,device_id,content_hash,deleted_at)
+                   VALUES(?,?,?,?,?,?,?,?,0)
+                   ON CONFLICT (kind, doc_id) DO UPDATE SET
+                     category=EXCLUDED.category, title=EXCLUDED.title, content=EXCLUDED.content,
+                     updated_at=EXCLUDED.updated_at, device_id=EXCLUDED.device_id,
+                     content_hash=EXCLUDED.content_hash, deleted_at=0"""
+            ).use { ps ->
+                ps.setString(1, kind); ps.setString(2, docId); ps.setString(3, category)
+                ps.setString(4, title); ps.setString(5, content); ps.setLong(6, updatedAt)
+                ps.setString(7, deviceId); ps.setString(8, contentHash)
+                ps.executeUpdate()
+            }
+        } else {
+            conn.prepareStatement(
+                """INSERT OR REPLACE INTO docs(kind,doc_id,category,title,content,updated_at,device_id,content_hash,deleted_at)
+                   VALUES(?,?,?,?,?,?,?,?,0)"""
+            ).use { ps ->
+                ps.setString(1, kind); ps.setString(2, docId); ps.setString(3, category)
+                ps.setString(4, title); ps.setString(5, content); ps.setLong(6, updatedAt)
+                ps.setString(7, deviceId); ps.setString(8, contentHash)
+                ps.executeUpdate()
+            }
         }
         logChange(kind, docId, deleted = false)
         return "new"
