@@ -50,6 +50,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var loadingOverlay: LinearLayout
     private lateinit var loadingText: TextView
     private lateinit var platformTitle: TextView
+    private lateinit var platformScreen: View
+    private lateinit var chatPage: View
+    private lateinit var platformList: LinearLayout
     private val handler = Handler(Looper.getMainLooper())
     private var selectedId = ""
     private var captureState = "正在初始化"
@@ -116,14 +119,17 @@ class MainActivity : AppCompatActivity() {
         scrollView = findViewById(R.id.browseScroll); detailScroll = findViewById(R.id.detailScroll)
         detailBody = findViewById(R.id.detailBody)
         detailBody.setTextIsSelectable(true)
+        loadingOverlay = findViewById(R.id.loadingOverlay); loadingText = findViewById(R.id.loadingText)
+        platformTitle = findViewById(R.id.platformTitle)
+        platformScreen = findViewById(R.id.platformScreen); chatPage = findViewById(R.id.chatPage)
+        platformList = findViewById(R.id.platformList)
         selectedId = graph.config.prefs.getString("last_conversation", "") ?: ""
         setupWebView(savedInstanceState)
         findViewById<View>(R.id.tabChat).setOnClickListener { switchTab(true) }
         findViewById<View>(R.id.tabNotes).setOnClickListener { switchTab(false); render() }
         findViewById<View>(R.id.settingsBtn).setOnClickListener { showMenu() }
-        captureInfo.setOnClickListener { if (webViewDestroyed) showRendererRecovery() else showPlatformPicker() }
-        loadingOverlay = findViewById(R.id.loadingOverlay); loadingText = findViewById(R.id.loadingText)
-        platformTitle = findViewById(R.id.platformTitle)
+        captureInfo.setOnClickListener { if (webViewDestroyed) showRendererRecovery() }
+        buildPlatformList()
         searchInput.addTextChangedListener(object : android.text.TextWatcher {
             override fun afterTextChanged(s: android.text.Editable?) {
                 renderGeneration++; renderLimit = 200
@@ -229,38 +235,79 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (state == null || webView.restoreState(state) == null) {
-            loadLastOrHome()
+            // 冷启动：不自动加载，等用户在平台选择页选平台后再加载
+            hasValidPage = false
         } else {
             // restoreState 只恢复导航历史不恢复页面内容：进程被杀重启后 WebView 停在
-            // about:blank 白屏（联调实测）。检测到无效页则重新加载。
+            // about:blank 白屏（联调实测）。检测到无效页则标记，待进入平台时重新加载。
             webView.evaluateJavascript("(function(){return location.href})()") { href ->
                 if (href == null || href.contains("about:blank") || href == "\"\"" || href == "null") {
-                    runOnUiThread { loadLastOrHome() }
+                    hasValidPage = false // 待用户从平台选择页进入时再加载
+                } else {
+                    hasValidPage = true
                 }
             }
         }
+        // 启动停在平台选择页；进入平台时才真正加载 WebView
+        platformScreen.visibility = View.VISIBLE
+        chatPage.visibility = View.GONE
+        acceptingCapture = false
     }
+    private var hasValidPage = false
     private fun loadLastOrHome() {
         val last = graph.config.prefs.getString("last_url", "https://chatgpt.com") ?: "https://chatgpt.com"
         webView.loadUrl(if (allowedNavigation(Uri.parse(last))) last else "https://chatgpt.com")
     }
     private fun allowedNavigation(uri: Uri): Boolean = Platform.match(uri) != null
 
-    /** 进入对话页时的平台选择（进入页面 → 选择平台 → 进入对话 → 捕获）。 */
-    private fun showPlatformPicker() {
-        val labels = Platform.ALL.map { it.label }.toTypedArray()
-        AlertDialog.Builder(this).setTitle("选择对话平台")
-            .setItems(labels) { _, i ->
-                val p = Platform.ALL[i]
-                graph.config.prefs.edit().putString("last_platform", p.id).apply()
-                updatePlatformTitle(p)
-                if (webViewDestroyed) showRendererRecovery()
-                else {
-                    switchTab(true)
-                    loadingOverlay.visibility = View.VISIBLE; loadingText.text = "加载中…"
-                    webView.loadUrl(p.homeUrl)
-                }
-            }.setNegativeButton("取消", null).show()
+    /** 平台选择页：对话 tab 的默认层。点平台进入对话页。 */
+    private fun buildPlatformList() {
+        platformList.removeAllViews()
+        Platform.ALL.forEach { p ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(20, 28, 20, 28)
+                background = getDrawable(android.R.drawable.list_selector_background)
+            }
+            row.addView(TextView(this).apply {
+                text = p.label; textSize = 16f; setTextColor(0xFF1A1D1F.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            row.addView(TextView(this).apply {
+                text = "›"; textSize = 18f; setTextColor(0xFF9CA3AF.toInt())
+            })
+            row.setOnClickListener { openPlatform(p) }
+            platformList.addView(row)
+        }
+    }
+
+    /** 进入某平台的对话页（同平台已有页面则复用，不重载）。 */
+    private fun openPlatform(p: Platform) {
+        graph.config.prefs.edit().putString("last_platform", p.id).apply()
+        updatePlatformTitle(p)
+        platformScreen.visibility = View.GONE
+        chatPage.visibility = View.VISIBLE
+        switchTab(true)
+        if (webViewDestroyed) { showRendererRecovery(); return }
+        val current = runCatching { webView.url }.getOrNull().orEmpty()
+        val currentPlatform = if (current.isEmpty()) null else Platform.match(Uri.parse(current))
+        if (hasValidPage && currentPlatform?.id == p.id) {
+            acceptingCapture = true // 恢复旁听，页面现场保留
+        } else {
+            loadingOverlay.visibility = View.VISIBLE; loadingText.text = "加载中…"
+            acceptingCapture = true
+            hasValidPage = true
+            webView.loadUrl(p.homeUrl)
+        }
+    }
+
+    /** 返回键：对话页 → 平台选择页（暂停采集，WebView 保留现场）。 */
+    fun onBackToPlatforms(view: View) {
+        chatPage.visibility = View.GONE
+        platformScreen.visibility = View.VISIBLE
+        loadingOverlay.visibility = View.GONE
+        acceptingCapture = false // 不再旁听该页面
     }
 
     private fun updatePlatformTitle(p: Platform) {
@@ -925,9 +972,9 @@ class MainActivity : AppCompatActivity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
+            chatVisible && chatPage.visibility == View.VISIBLE -> onBackToPlatforms(chatPage)
             !chatVisible && detailScroll.visibility == View.VISIBLE -> onBackFromDetail(detailScroll)
             !chatVisible && folders.isNotEmpty() -> { folders.removeAt(folders.lastIndex); render() }
-            chatVisible && !webViewDestroyed && webView.canGoBack() -> webView.goBack()
             !chatVisible -> switchTab(true)
             else -> super.onBackPressed()
         }
