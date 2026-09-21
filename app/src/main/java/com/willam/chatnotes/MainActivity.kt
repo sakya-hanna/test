@@ -383,6 +383,17 @@ class MainActivity : AppCompatActivity() {
             return EditText(this).apply { inputType = type; setText(value); this.hint = hint; wrap.addView(this) }
         }
         val prefs = graph.config.prefs
+        // 同步状态摘要（P1：状态可视化最小版）
+        val lastSync = prefs.getLong("sync_last_ok", 0L)
+        val lastSyncText = if (lastSync > 0)
+            "上次同步成功：${java.text.SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(java.util.Date(lastSync))}"
+        else "尚未同步成功过"
+        val state = graph.config.syncState()
+        wrap.addView(TextView(this).apply {
+            text = "$lastSyncText\n已同步 ${state.hashes.size} 篇 · 服务器进度 $state.cursor"
+            textSize = 12f; setPadding(0, 0, 0, 16)
+            setTextColor(Color.rgb(0x6B, 0x72, 0x80))
+        })
         val url = field("后台同步地址（可留空关闭同步）", prefs.getString("sync_base_url", "") ?: "", "https://1.2.3.4:8443", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         val token = field("同步令牌", runCatching { graph.config.syncToken() }.getOrDefault(""), "服务器 token.txt 的内容", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         AlertDialog.Builder(this).setTitle("后台同步设置").setView(ScrollView(this).apply { addView(wrap) })

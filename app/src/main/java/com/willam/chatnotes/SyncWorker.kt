@@ -85,6 +85,10 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             state = state.copy(hashes = state.hashes - delIds.toSet())
         }
         graph.config.saveSyncState(state)
+        if (pushOutcome is SyncOutcome.Ok && delOutcome is SyncOutcome.Ok && writeFailures.isEmpty()) {
+            applicationContext.getSharedPreferences("config", Context.MODE_PRIVATE)
+                .edit().putLong("sync_last_ok", System.currentTimeMillis()).apply()
+        }
         return Result.success()
     }
 
