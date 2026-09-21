@@ -38,3 +38,5 @@ captures/
 *.keystore
 !debug.keystore
 config-backup/
+token.txt
+chatnotes-server.db*

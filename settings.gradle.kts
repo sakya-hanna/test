@@ -14,3 +14,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "ChatNotes"
 include(":app")
+include(":shared")
+include(":server")
