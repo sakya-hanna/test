@@ -88,7 +88,7 @@ class SyncApiTest {
 
     @Test
     fun `push 后 pull 能取回同一文档`() = withApp { token, client ->
-        val d = doc("abc123", "# 笔记 abc123\n\n内容", updatedAt = 5000L)
+        val d = doc("a".repeat(64), "# 笔记 abc123\n\n内容", updatedAt = 5000L)
         val pushResp = client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
         assertEquals(HttpStatusCode.OK, pushResp.status)
         assertTrue(pushResp.bodyAsText().contains("\"status\":\"new\""))
@@ -96,13 +96,13 @@ class SyncApiTest {
         val pullResp = client.postJsonRaw("/v1/pull", token, json.encodeToString(PullRequest.serializer(), PullRequest(deviceId = "phone-1", cursor = 0)))
         assertEquals(HttpStatusCode.OK, pullResp.status)
         val body = pullResp.bodyAsText()
-        assertTrue(body.contains("abc123"))
+        assertTrue(body.contains("a".repeat(64)))
         assertTrue(body.contains("# 笔记 abc123"))
     }
 
     @Test
     fun `push 幂等：同内容重复推送不产生新变更`() = withApp { token, client ->
-        val d = doc("abc123", "内容")
+        val d = doc("a".repeat(64), "内容")
         val first = client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
         assertTrue(first.bodyAsText().contains("\"status\":\"new\""))
         val second = client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
@@ -111,17 +111,17 @@ class SyncApiTest {
 
     @Test
     fun `push 内容 hash 不符被拒绝`() = withApp { token, client ->
-        val d = doc("abc123", "内容").copy(contentHash = "deadbeefdeadbeef")
+        val d = doc("a".repeat(64), "内容").copy(contentHash = "deadbeefdeadbeef")
         val resp = client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
         assertTrue(resp.bodyAsText().contains("bad_hash"))
     }
 
     @Test
     fun `删除后 pull 保留墓碑但内容不可得`() = withApp { token, client ->
-        val d = doc("abc123", "内容")
+        val d = doc("a".repeat(64), "内容")
         client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
         val before = client.postJsonRaw("/v1/pull", token, json.encodeToString(PullRequest.serializer(), PullRequest(deviceId = "phone-1", cursor = 0)))
-        assertTrue(before.bodyAsText().contains("abc123"))
+        assertTrue(before.bodyAsText().contains("a".repeat(64)))
 
         client.postJsonRaw(
             "/v1/delete", token,
@@ -129,19 +129,19 @@ class SyncApiTest {
                 DeleteRequest.serializer(),
                 DeleteRequest(
                     deviceId = "phone-1",
-                    deletes = listOf(DeleteMark(kind = DocKind.note, docId = "abc123", deletedAt = 9000L, deviceId = "phone-1")),
+                    deletes = listOf(DeleteMark(kind = DocKind.note, docId = "a".repeat(64), deletedAt = 9000L, deviceId = "phone-1")),
                 ),
             ),
         )
         val after = client.postJsonRaw("/v1/pull", token, json.encodeToString(PullRequest.serializer(), PullRequest(deviceId = "phone-1", cursor = 0)))
-        assertTrue(after.bodyAsText().contains("abc123"))       // 变更日志保留墓碑
+        assertTrue(after.bodyAsText().contains("a".repeat(64)))       // 变更日志保留墓碑
         assertTrue(!after.bodyAsText().contains("内容"))         // 内容已软删不可得
     }
 
     @Test
     fun `push 旧版本被服务器较新版本拒绝`() = withApp { token, client ->
-        val newer = doc("abc123", "新内容", updatedAt = 8000L)
-        val older = doc("abc123", "旧内容", updatedAt = 5000L)
+        val newer = doc("a".repeat(64), "新内容", updatedAt = 8000L)
+        val older = doc("a".repeat(64), "旧内容", updatedAt = 5000L)
         client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(newer))))
         val resp = client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(older))))
         assertTrue(resp.bodyAsText().contains("\"status\":\"older\""))
@@ -149,8 +149,8 @@ class SyncApiTest {
 
     @Test
     fun `pull 同一文档多次变更只返回最新一条`() = withApp { token, client ->
-        val d1 = doc("abc123", "第一版", updatedAt = 1000L)
-        val d2 = doc("abc123", "第二版", updatedAt = 2000L)
+        val d1 = doc("a".repeat(64), "第一版", updatedAt = 1000L)
+        val d2 = doc("a".repeat(64), "第二版", updatedAt = 2000L)
         client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d1))))
         client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d2))))
         client.postJsonRaw(
@@ -159,13 +159,13 @@ class SyncApiTest {
                 DeleteRequest.serializer(),
                 DeleteRequest(
                     deviceId = "phone-1",
-                    deletes = listOf(DeleteMark(kind = DocKind.note, docId = "abc123", deletedAt = 3000L, deviceId = "phone-1")),
+                    deletes = listOf(DeleteMark(kind = DocKind.note, docId = "a".repeat(64), deletedAt = 3000L, deviceId = "phone-1")),
                 ),
             ),
         )
         val resp = client.postJsonRaw("/v1/pull", token, json.encodeToString(PullRequest.serializer(), PullRequest(deviceId = "phone-1", cursor = 0)))
         val body = resp.bodyAsText()
-        assertEquals(1, Regex("\"docId\":\"abc123\"").findAll(body).count(), "同一文档应只出现一次：$body")
+        assertEquals(1, Regex("\"docId\":\"" + "a".repeat(64) + "\"").findAll(body).count(), "同一文档应只出现一次：$body")
         assertTrue(body.contains("\"content\":\"\""), "最新变更是删除，内容应为空：$body")
     }
 }

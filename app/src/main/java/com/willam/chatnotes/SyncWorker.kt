@@ -29,32 +29,34 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         val graph = AppGraph.get(applicationContext)
         val config = graph.config.syncConfig() ?: return Result.success() // 未配置同步：直接完成
         val engine = SyncEngine(config.baseUrl, config.token, deviceId(applicationContext))
+        fun log(m: String) = android.util.Log.d("ChatNotes", "sync: $m")
 
-        // 1) 全量对账：先 pull 服务器增量（其他设备/本机删除的墓碑）
+        // 1) 全量对账：pull 服务器增量（其他设备写入 + 删除墓碑）
         var cursor = graph.config.syncCursor()
         var nPulled = 0
         var nDeleted = 0
-        val writes = mutableListOf<SyncDoc>()
-        val tombstones = mutableListOf<com.willam.chatnotes.shared.sync.SyncDoc>()
+        val writeFailures = mutableListOf<String>()
         while (true) {
             val (outcome, resp) = engine.pull(cursor)
             when (outcome) {
-                is SyncOutcome.Unreachable -> return Result.success() // 静默：下次再同步
-                is SyncOutcome.Rejected -> return Result.failure()   // 配置问题：不重试
+                is SyncOutcome.Unreachable -> { log("unreachable: ${outcome.cause}"); return Result.success() } // 静默：下次再同步
+                is SyncOutcome.Rejected -> { log("rejected: ${outcome.detail}"); return Result.failure() }      // 配置问题：不重试
                 is SyncOutcome.Ok -> {}
             }
             val body = resp!!
             val localHashes = localHashes(graph)
             val (w, d) = SyncLogic.applyPull(body.docs, localHashes)
-            writes += w
-            tombstones += d
             nPulled += body.docs.size
-            cursor = body.cursor
+            // 先应用写入；有任何失败则光标停在变更前，下次重拉（拉取与写入均幂等）
+            val failures = applyWrites(graph, w)
+            writeFailures += failures
+            for (t in d) if (deleteLocalNote(graph, t.docId)) nDeleted++
+            cursor = if (failures.isEmpty()) body.cursor else cursor
+            log("pull batch: docs=${body.docs.size} writes=${w.size} fails=${failures.size} cursor=$cursor")
             if (!body.hasMore) break
         }
-        // 应用 pull 结果：墓碑删除本地文件；写入仅落盘（索引重建由现有入口覆盖）
-        for (t in tombstones) if (deleteLocalNote(graph, t.docId)) nDeleted++
-        for (w in writes) writeRemoteNote(graph, w)
+        if (writeFailures.isNotEmpty()) log("WARN write failures: $writeFailures")
+        log("pull done: nPulled=$nPulled nDeleted=$nDeleted cursor=$cursor")
 
         // 2) push：本地新增/有变化的笔记
         val synced = graph.config.syncState()
@@ -68,6 +70,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             )
         }
         val pushOutcome = engine.push(docs)
+        log("push: n=${docs.size} -> $pushOutcome")
 
         // 3) 广播本地删除（pull 阶段没覆盖的：本地刚删、服务器还不知道）
         val delIds = SyncLogic.planDeletes(locals.map { it.docId }.toSet(), synced.hashes.keys)
@@ -109,10 +112,20 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     private fun deleteLocalNote(graph: AppGraph, docId: String): Boolean =
         graph.notes.allFiles().firstOrNull { noteId(it) == docId }?.let { it.delete() } ?: false
 
-    private fun writeRemoteNote(graph: AppGraph, d: SyncDoc) {
-        val cats = if (d.category.isBlank()) emptyList() else d.category.split('/', '\\').filter { it.isNotBlank() }
+    /** 写入远端下发的笔记；返回失败的 docId（调用方据此不推进光标，下次重拉） */
+    private fun applyWrites(graph: AppGraph, writes: List<SyncDoc>): List<String> {
+        val failed = mutableListOf<String>()
         val files = com.willam.chatnotes.NoteFiles(File(graph.app.filesDir, "notes"))
-        runCatching { files.write(cats, d.title, d.docId, d.content) }
+        for (d in writes) {
+            val cats = if (d.category.isBlank()) emptyList() else d.category.split('/', '\\').filter { it.isNotBlank() }
+            try {
+                files.write(cats, d.title, d.docId, d.content)
+            } catch (e: Exception) {
+                android.util.Log.w("ChatNotes", "sync: write failed ${d.docId}: ${e.message}")
+                failed.add(d.docId)
+            }
+        }
+        return failed
     }
 
     private fun deviceId(context: Context): String {

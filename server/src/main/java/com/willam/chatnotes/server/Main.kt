@@ -83,15 +83,20 @@ fun Application.syncModule(store: SyncStore, token: String) {
                 val req = call.receive<PushRequest>()
                 if (req.deviceId.isBlank()) return@post call.badRequest("deviceId required")
                 val results = req.docs.map { d ->
-                    if (d.contentHash != sha256Hex16(d.content)) {
-                        PushResultItem(d.docId, "bad_hash")
-                    } else {
-                        val status = store.upsert(
-                            kind = d.kind.name, docId = d.docId, category = d.category,
-                            title = d.title, content = d.content, updatedAt = d.updatedAt,
-                            deviceId = d.deviceId, contentHash = d.contentHash,
-                        )
-                        PushResultItem(d.docId, status, serverUpdatedAt = d.updatedAt)
+                    when {
+                        // note ID 必须是 64hex（端上文件名强制），坏 ID 直接拒绝且不推进
+                        d.kind == DocKind.note && !d.docId.matches(Regex("[a-f0-9]{64}")) ->
+                            PushResultItem(d.docId, "bad_id")
+                        d.contentHash != sha256Hex16(d.content) ->
+                            PushResultItem(d.docId, "bad_hash")
+                        else -> {
+                            val status = store.upsert(
+                                kind = d.kind.name, docId = d.docId, category = d.category,
+                                title = d.title, content = d.content, updatedAt = d.updatedAt,
+                                deviceId = d.deviceId, contentHash = d.contentHash,
+                            )
+                            PushResultItem(d.docId, status, serverUpdatedAt = d.updatedAt)
+                        }
                     }
                 }
                 store.touchDevice(req.deviceId, System.currentTimeMillis())
