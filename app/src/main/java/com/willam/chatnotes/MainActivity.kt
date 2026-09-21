@@ -26,6 +26,7 @@ import androidx.webkit.WebViewFeature
 import androidx.work.WorkManager
 import io.noties.markwon.Markwon
 import org.json.JSONObject
+import java.io.File
 import java.util.Locale
 import java.util.Date
 import java.util.concurrent.RejectedExecutionException
@@ -403,6 +404,120 @@ class MainActivity : AppCompatActivity() {
             }
     }
 
+    // ---- P0 笔记管理：编辑 / 重命名 / 移动 / 删除 ----
+
+    /** 笔记长按菜单。所有操作完成后：刷新索引 + 触发同步（编辑/移动产生新版本，删除产生墓碑）。 */
+    private fun showNoteActions(file: File) {
+        val ops = NoteOps(graph.notes.root)
+        val meta = diskOnce { ops.metaOf(file) } ?: run { toast("不是可管理的笔记文件"); return }
+        val actions = arrayOf("编辑内容", "重命名", "移动分类", "删除")
+        AlertDialog.Builder(this).setTitle(meta.title).setItems(actions) { _, i ->
+            when (i) {
+                0 -> editNoteDialog(ops, meta)
+                1 -> renameNoteDialog(ops, meta)
+                2 -> moveNoteDialog(ops, meta)
+                3 -> deleteNoteConfirm(ops, meta)
+            }
+        }.show()
+    }
+
+    private fun editNoteDialog(ops: NoteOps, meta: NoteOps.Meta) {
+        diskOnce({ graph.notes.readNote(meta.file) }) { markdown ->
+            val input = EditText(this).apply {
+                setText(markdown)
+                minLines = 12; gravity = android.view.Gravity.TOP
+                setSingleLine(false)
+                setTextIsSelectable(false)
+            }
+            val wrap = ScrollView(this).apply { addView(input) }
+            AlertDialog.Builder(this).setTitle("编辑：${meta.title}")
+                .setView(wrap)
+                .setPositiveButton("保存") { _, _ ->
+                    val next = input.text.toString()
+                    disk({
+                        ops.writeContent(meta, next)
+                        graph.search.ensureIndexed(graph.notes, graph.db)
+                    }, {
+                        toast("已保存")
+                        SyncWorker.enqueueAfterNoteChange(applicationContext)
+                        render()
+                    })
+                }
+                .setNegativeButton("取消", null)
+                .show()
+        }
+    }
+
+    private fun renameNoteDialog(ops: NoteOps, meta: NoteOps.Meta) {
+        val input = EditText(this).apply { setText(meta.title) }
+        AlertDialog.Builder(this).setTitle("重命名").setView(input)
+            .setPositiveButton("保存") { _, _ ->
+                val next = input.text.toString().trim()
+                if (next.isEmpty() || next == meta.title) return@setPositiveButton
+                disk({
+                    ops.rename(meta, next)
+                    graph.search.ensureIndexed(graph.notes, graph.db)
+                }, {
+                    toast("已重命名")
+                    SyncWorker.enqueueAfterNoteChange(applicationContext)
+                    render()
+                })
+            }
+            .setNegativeButton("取消", null).show()
+    }
+
+    private fun moveNoteDialog(ops: NoteOps, meta: NoteOps.Meta) {
+        val input = EditText(this).apply { setText(meta.category); hint = "如：编程/Kotlin（2-4 级，/ 分隔）" }
+        AlertDialog.Builder(this).setTitle("移动分类").setView(input)
+            .setPositiveButton("移动") { _, _ ->
+                val next = input.text.toString().trim()
+                if (next.isEmpty() || next == meta.category) return@setPositiveButton
+                disk({
+                    ops.move(meta, next)
+                    graph.search.ensureIndexed(graph.notes, graph.db)
+                }, {
+                    toast("已移动到 $next")
+                    SyncWorker.enqueueAfterNoteChange(applicationContext)
+                    folders.clear(); render()
+                })
+            }
+            .setNegativeButton("取消", null).show()
+    }
+
+    private fun deleteNoteConfirm(ops: NoteOps, meta: NoteOps.Meta) {
+        AlertDialog.Builder(this).setTitle("删除笔记")
+            .setMessage("「${meta.title}」将被删除。已同步到后台的副本会一并标记删除；此操作不可撤销。")
+            .setPositiveButton("删除") { _, _ ->
+                disk({
+                    ops.delete(meta)
+                    graph.search.ensureIndexed(graph.notes, graph.db) // 孤儿清理：索引/向量同步移除
+                }, {
+                    toast("已删除")
+                    SyncWorker.enqueueAfterNoteChange(applicationContext) // planDeletes 广播墓碑
+                    render()
+                })
+            }
+            .setNegativeButton("取消", null).show()
+    }
+
+    /** 同步一次性后台任务（不走渲染队列，避免打断列表）。带回调版。 */
+    private fun <T> diskOnce(work: () -> T, done: (T) -> Unit) {
+        try {
+            graph.io.execute { val r = runCatching(work); ui { r.fold(done) { error(it.message ?: "操作失败") } } }
+        } catch (_: java.util.concurrent.RejectedExecutionException) { error("后台忙，请稍后重试") }
+    }
+
+    /** 同步一次性后台任务（无回调）。 */
+    private fun <T> diskOnce(work: () -> T): T? {
+        var result: T? = null
+        val latch = java.util.concurrent.CountDownLatch(1)
+        try {
+            graph.io.execute { result = runCatching(work).getOrNull(); latch.countDown() }
+            latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: Exception) { }
+        return result
+    }
+
     private fun showConversations() {
         disk({ graph.db.conversations() }) { conversations ->
             if (conversations.isEmpty()) { toast("尚无已保存的原文"); return@disk }
@@ -547,6 +662,7 @@ class MainActivity : AppCompatActivity() {
                                 markwon.setMarkdown(detailBody, markdown); scrollView.visibility = View.GONE; detailScroll.visibility = View.VISIBLE
                             }
                         }
+                        if (!n.isFolder) row.setOnLongClickListener { showNoteActions(n.file); true }
                         listBox.addView(row)
                     }
                 }
@@ -629,6 +745,7 @@ class MainActivity : AppCompatActivity() {
                 "conv" -> showConversation(hit.conversationId)
             }
         }
+        if (hit.kind == "note") card.setOnLongClickListener { showNoteActions(hit.file); true }
         return card
     }
     fun onBackFromDetail(view: View) { detailScroll.visibility = View.GONE; scrollView.visibility = View.VISIBLE }
