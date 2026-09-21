@@ -206,9 +206,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (state == null || webView.restoreState(state) == null) {
-            val last = graph.config.prefs.getString("last_url", "https://chatgpt.com") ?: "https://chatgpt.com"
-            webView.loadUrl(if (allowedNavigation(Uri.parse(last))) last else "https://chatgpt.com")
+            loadLastOrHome()
+        } else {
+            // restoreState 只恢复导航历史不恢复页面内容：进程被杀重启后 WebView 停在
+            // about:blank 白屏（联调实测）。检测到无效页则重新加载。
+            webView.evaluateJavascript("(function(){return location.href})()") { href ->
+                if (href == null || href.contains("about:blank") || href == "\"\"" || href == "null") {
+                    runOnUiThread { loadLastOrHome() }
+                }
+            }
         }
+    }
+    private fun loadLastOrHome() {
+        val last = graph.config.prefs.getString("last_url", "https://chatgpt.com") ?: "https://chatgpt.com"
+        webView.loadUrl(if (allowedNavigation(Uri.parse(last))) last else "https://chatgpt.com")
     }
     private fun allowedNavigation(uri: Uri): Boolean = uri.scheme == "https" && uri.port in setOf(-1, 443) &&
         uri.host in setOf("chatgpt.com", "chat.openai.com", "auth.openai.com", "auth0.openai.com") && uri.userInfo == null
