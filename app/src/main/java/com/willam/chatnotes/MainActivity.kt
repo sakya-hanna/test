@@ -47,6 +47,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollView: ScrollView
     private lateinit var detailScroll: ScrollView
     private lateinit var detailBody: TextView
+    private lateinit var loadingOverlay: LinearLayout
+    private lateinit var loadingText: TextView
+    private lateinit var platformTitle: TextView
     private val handler = Handler(Looper.getMainLooper())
     private var selectedId = ""
     private var captureState = "正在初始化"
@@ -118,7 +121,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.tabChat).setOnClickListener { switchTab(true) }
         findViewById<View>(R.id.tabNotes).setOnClickListener { switchTab(false); render() }
         findViewById<View>(R.id.settingsBtn).setOnClickListener { showMenu() }
-        captureInfo.setOnClickListener { if (webViewDestroyed) showRendererRecovery() }
+        captureInfo.setOnClickListener { if (webViewDestroyed) showRendererRecovery() else showPlatformPicker() }
+        loadingOverlay = findViewById(R.id.loadingOverlay); loadingText = findViewById(R.id.loadingText)
+        platformTitle = findViewById(R.id.platformTitle)
         searchInput.addTextChangedListener(object : android.text.TextWatcher {
             override fun afterTextChanged(s: android.text.Editable?) {
                 renderGeneration++; renderLimit = 200
@@ -156,13 +161,14 @@ class MainActivity : AppCompatActivity() {
         documentStart = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
         script = InterceptorJs.source(this)
         if (bridgeReady) {
-            WebViewCompat.addWebMessageListener(webView, "chatnotesProxy", setOf("https://chatgpt.com")) { _, message, origin, mainFrame, _ ->
-                if (mainFrame && origin.scheme == "https" && origin.host == "chatgpt.com" && origin.port in setOf(-1, 443)) {
+            // listener 与 document-start 的 origin 白名单覆盖全部支持平台。
+            WebViewCompat.addWebMessageListener(webView, "chatnotesProxy", Platform.jsOrigins) { _, message, origin, mainFrame, _ ->
+                if (mainFrame && Platform.match(origin) != null) {
                     val data = runCatching { message.data }.getOrNull()
                     if (data != null) intercept(data)
                 }
             }
-            if (documentStart) WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("https://chatgpt.com"))
+            if (documentStart) WebViewCompat.addDocumentStartJavaScript(webView, script, Platform.jsOrigins)
         } else {
             captureState = "当前 WebView 不支持安全采集，请更新 Android System WebView"
             captureWarning = true; refreshCount()
@@ -178,8 +184,11 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
             override fun onPageFinished(view: WebView, url: String) {
+                loadingOverlay.visibility = View.GONE
                 val uri = Uri.parse(url)
-                if (bridgeReady && uri.scheme == "https" && uri.host == "chatgpt.com" && !documentStart) {
+                val platform = Platform.match(uri)
+                platform?.let { updatePlatformTitle(it) }
+                if (bridgeReady && platform != null && !documentStart) {
                     view.evaluateJavascript(script, null)
                     view.evaluateJavascript("window.__chatnotes && window.__chatnotes.captureDom()", null)
                 }
@@ -197,6 +206,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                // 加载中：遮罩+圆圈，避免半渲染页面看起来卡死
+                if (newProgress < 90) {
+                    loadingOverlay.visibility = View.VISIBLE
+                    loadingText.text = "加载中…"
+                } else if (newProgress >= 100) {
+                    loadingOverlay.visibility = View.GONE
+                }
+            }
             override fun onShowFileChooser(view: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
                 fileCallback?.onReceiveValue(null); fileCallback = callback
                 return try {
@@ -226,8 +244,28 @@ class MainActivity : AppCompatActivity() {
         val last = graph.config.prefs.getString("last_url", "https://chatgpt.com") ?: "https://chatgpt.com"
         webView.loadUrl(if (allowedNavigation(Uri.parse(last))) last else "https://chatgpt.com")
     }
-    private fun allowedNavigation(uri: Uri): Boolean = uri.scheme == "https" && uri.port in setOf(-1, 443) &&
-        uri.host in setOf("chatgpt.com", "chat.openai.com", "auth.openai.com", "auth0.openai.com") && uri.userInfo == null
+    private fun allowedNavigation(uri: Uri): Boolean = Platform.match(uri) != null
+
+    /** 进入对话页时的平台选择（进入页面 → 选择平台 → 进入对话 → 捕获）。 */
+    private fun showPlatformPicker() {
+        val labels = Platform.ALL.map { it.label }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("选择对话平台")
+            .setItems(labels) { _, i ->
+                val p = Platform.ALL[i]
+                graph.config.prefs.edit().putString("last_platform", p.id).apply()
+                updatePlatformTitle(p)
+                if (webViewDestroyed) showRendererRecovery()
+                else {
+                    switchTab(true)
+                    loadingOverlay.visibility = View.VISIBLE; loadingText.text = "加载中…"
+                    webView.loadUrl(p.homeUrl)
+                }
+            }.setNegativeButton("取消", null).show()
+    }
+
+    private fun updatePlatformTitle(p: Platform) {
+        platformTitle.text = p.label
+    }
     private fun intercept(raw: String) {
         if (!acceptingCapture) return
         val now = SystemClock.elapsedRealtime()

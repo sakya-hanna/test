@@ -1,6 +1,7 @@
 package com.willam.chatnotes
 
 import android.content.ContentValues
+import android.net.Uri
 import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
@@ -82,7 +83,10 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
                     val values = ContentValues()
                     if (j.has("title") && j.text("title").isNotBlank()) values.put("title", j.text("title").take(200))
                     val url = j.text("url")
-                    if (url.startsWith("https://chatgpt.com/")) values.put("url", url.take(1000))
+                    // 任意支持平台的会话 URL 均入库（https 且 host 在平台白名单）
+                    runCatching { Uri.parse(url) }.getOrNull()?.let { u ->
+                        if (Platform.match(u) != null) values.put("url", url.take(1000))
+                    }
                     val leaf = j.text("activeLeaf")
                     if (leaf.isNotEmpty() && message(db, cid, leaf) != null) values.put("leaf", leaf)
                     if (j.text("coverage") == "history") values.put("coverage", "history")

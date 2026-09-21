@@ -5,6 +5,8 @@
   var MAX_TEXT = 180000, MAX_STREAM = 8 * 1024 * 1024, MAX_JSON = 4 * 1024 * 1024;
   var latest = Object.create(null), contexts = [], localId = uid('local:'), activeId = '';
   var lastRoute = '', networkMessages = 0;
+  // Platform detection: the capture script is shared; route/SSE/DOM details adapt per site.
+  var PLATFORM = window.location.host === 'chat.deepseek.com' ? 'deepseek' : 'chatgpt';
   function uid(prefix) {
     return prefix + (window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() :
       Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -15,7 +17,9 @@
   function notice(text) { send({type: 'notice', message: text}); }
   function currentUrl() { return String(window.location.href); }
   function routeId() {
-    var m = new URL(currentUrl()).pathname.match(/\/c\/([a-zA-Z0-9_-]+)/);
+    var path = new URL(currentUrl()).pathname;
+    var m = PLATFORM === 'deepseek' ? path.match(/\/a\/chat\/s\/([a-zA-Z0-9_-]+)/)
+                                    : path.match(/\/c\/([a-zA-Z0-9_-]+)/);
     return m ? m[1] : '';
   }
   function activate(cid) {
@@ -36,15 +40,21 @@
   var titleTimer = 0, lastTitle = '';
   function extractDomTitle() {
     if (!routeId()) return;
-    // Sidebar link for the current conversation carries its title.
-    var link = window.document.querySelector(
-      'a[href*="/c/' + routeId() + '"][aria-label], a[data-testid*="conversation"][href*="' + routeId() + '"]');
     var label = '';
-    try { label = (link && link.getAttribute('aria-label') || '').replace(/^\s*(对话|Chat)\s*[:：]?\s*/i, '').trim(); } catch (_) {}
-    if (!label) {
-      // document.title is usually the conversation topic on chatgpt.com.
+    if (PLATFORM === 'deepseek') {
+      // DeepSeek: document.title tracks the conversation topic once a message exists.
       var t = String(window.document.title || '').trim();
-      if (t && !/^(chatgpt|new chat|新对话|登录|log in)/i.test(t)) label = t;
+      if (t && !/^(deepseek|new chat|开启新对话|登录|log in)/i.test(t)) label = t;
+    } else {
+      // Sidebar link for the current conversation carries its title.
+      var link = window.document.querySelector(
+        'a[href*="/c/' + routeId() + '"][aria-label], a[data-testid*="conversation"][href*="' + routeId() + '"]');
+      try { label = (link && link.getAttribute('aria-label') || '').replace(/^\s*(对话|Chat)\s*[:：]?\s*/i, '').trim(); } catch (_) {}
+      if (!label) {
+        // document.title is usually the conversation topic on chatgpt.com.
+        var t2 = String(window.document.title || '').trim();
+        if (t2 && !/^(chatgpt|new chat|新对话|登录|log in)/i.test(t2)) label = t2;
+      }
     }
     if (label && label !== lastTitle) {
       lastTitle = label;
@@ -244,6 +254,104 @@
       status: final ? 'complete' : 'streaming', sentAt: old ? old.sentAt : 0};
     if (final || !old || Date.now() - item.sentAt >= 400) publish(ctx, item, item.status);
   }
+  // ---- DeepSeek: NDJSON fragment stream (response is a JSON-lines chunk sequence) ----
+  function deepseekText(obj) {
+    // Accept string content or {text: "..."} / {content: "..."} shapes seen in fragments.
+    if (!obj) return '';
+    if (typeof obj === 'string') return obj;
+    if (typeof obj.text === 'string') return obj.text;
+    if (typeof obj.content === 'string') return obj.content;
+    if (Array.isArray(obj)) return obj.map(deepseekText).join('');
+    return '';
+  }
+  function deepseekEmit(ctx, item) {
+    if (ctx.closed) return;
+    var text = deepseekText(item.content);
+    if (!text.trim()) return;
+    var m = {id: item.id || uid('ds:'), author: {role: item.role || 'assistant'}, content: {parts: [text]}};
+    if (emit(ctx, m, item.final ? 'complete' : 'streaming', 'network', item.parent || '', true)) networkMessages++;
+  }
+  function deepseekApply(ctx, frag) {
+    // Fragment shapes (tolerant): {v: {message: {id, role, content...}, ...}} n-th patch deltas,
+    // or flat {message_id/content} fields. Accumulate text per message id.
+    var msg = frag && frag.v && frag.v.message ? frag.v.message
+      : (frag && frag.message) || (frag && frag.v && frag.v.message_content ? frag.v : null);
+    if (!msg) { ctx.unknown++; return; }
+    var id = String(msg.id || msg.message_id || 'ds');
+    var role = msg.role || (msg.author && msg.author.role) || 'assistant';
+    var piece = deepseekText(msg.content !== undefined ? msg.content : msg);
+    var fin = frag.v ? (frag.v.finish_reason === 'stop' || !!frag.v.done || frag.v.status === 'finished') : true;
+    var st = ctx.answers[id];
+    if (!st) {
+      st = ctx.answers[id] = {id: id, role: role, content: '', final: false, sentAt: 0, parent: ''};
+    }
+    if (piece) st.content += piece;
+    if (fin) st.final = true;
+    if (st.final || Date.now() - st.sentAt >= 400) {
+      deepseekEmit(ctx, st); st.sentAt = Date.now();
+    }
+  }
+  async function observeDeepseek(resp, ctx) {
+    if (!resp.ok) { usersStatus(ctx, 'failed'); return; }
+    var ct = resp.headers.get('content-type') || '';
+    var reader = resp.body ? resp.body.getReader() : null;
+    var decoder = new TextDecoder(), buffer = '', bytes = 0;
+    var timer = setTimeout(function () { reader && reader.cancel().catch(function () {}); }, 240000);
+    try {
+      if (ct.indexOf('json') >= 0 || ct.indexOf('event-stream') < 0 && !reader) {
+        // Single JSON body (non-streamed or whole response)
+        var text = '';
+        if (reader) {
+          while (true) {
+            var r = await reader.read();
+            if (r.done) break;
+            bytes += r.value.byteLength;
+            if (bytes > MAX_STREAM) throw new Error('limit');
+            text += decoder.decode(r.value, {stream: true});
+          }
+          text += decoder.decode();
+        }
+        var head = text.slice(0, 1);
+        if (head === '[' || head === '{') {
+          try {
+            var whole = JSON.parse(text);
+            (Array.isArray(whole) ? whole : [whole]).forEach(function (frag) { deepseekApply(ctx, frag); });
+          } catch (_) { ctx.unknown++; }
+        }
+      } else if (reader) {
+        // NDJSON lines
+        while (true) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+          bytes += chunk.value.byteLength;
+          if (bytes > MAX_STREAM) throw new Error('limit');
+          buffer += decoder.decode(chunk.value, {stream: true});
+          var i;
+          while ((i = buffer.indexOf('\n')) >= 0) {
+            var line = buffer.slice(0, i).replace(/\r$/, ''); buffer = buffer.slice(i + 1);
+            if (!line.trim() || line.trim() === '[DONE]') continue;
+            if (line.indexOf('data:') === 0) line = line.slice(5).replace(/^\s/, '');
+            try { deepseekApply(ctx, JSON.parse(line)); }
+            catch (_) { ctx.unknown++; ctx.unsupported = true; }
+          }
+        }
+        if (buffer.trim() && buffer.trim() !== '[DONE]') {
+          try { deepseekApply(ctx, JSON.parse(buffer.trim())); } catch (_) { ctx.unknown++; }
+        }
+      }
+      flush(ctx, ctx.unsupported ? 'partial' : 'complete');
+      if (ctx.unsupported || !Object.keys(ctx.answers).length) {
+        notice(ctx.unsupported ? '回复协议未识别，已保存部分内容，请用页面补采集核对。' : '本次回复未捕获到内容，请用页面补采集。');
+        captureDom();
+      }
+    } catch (_) {
+      flush(ctx, 'partial');
+      notice('回复采集中断，已保存收到的内容，可重新加载会话补采集。');
+    } finally {
+      clearTimeout(timer);
+      if (reader) { reader.cancel().catch(function () {}); reader.releaseLock(); }
+    }
+  }
   async function observeStream(resp, ctx) {
     var reader = resp.body.getReader(), decoder = new TextDecoder(), buffer = '', data = [];
     ctx.cancelObserver = function () { reader.cancel().catch(function () {}); };
@@ -377,6 +485,36 @@
     var url;
     try { url = new URL(typeof input === 'string' ? input : input.url || String(input), currentUrl()); }
     catch (_) { return originalFetch(input, init); }
+    if (PLATFORM === 'deepseek') {
+      if (url.origin !== 'https://chat.deepseek.com') return originalFetch(input, init);
+      // DeepSeek web app: POST /api/v0/chat/completion streams NDJSON fragments.
+      if (!/^\/api\/v0\/chat\/completion/.test(url.pathname) || String(init && init.method || 'POST').toUpperCase() !== 'POST')
+        return originalFetch(input, init);
+      var dctx = {cid: activeId || localId, token: uid('req:'), users: [], answers: Object.create(null),
+        parent: '', time: Date.now(), unknown: 0};
+      contexts.push(dctx);
+      send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'start'});
+      var df;
+      try { df = originalFetch(input, init); }
+      catch (e) { usersStatus(dctx, 'failed'); dctx.closed = true; var i0 = contexts.indexOf(dctx); if (i0 >= 0) contexts.splice(i0, 1); throw e; }
+      return df.then(function (resp) {
+        var copy;
+        try { copy = resp.clone(); }
+        catch (_) { notice('无法复制响应，网页仍可使用；请核对采集结果。'); usersStatus(dctx, 'partial'); return resp; }
+        observeDeepseek(copy, dctx).catch(function () { flush(dctx, 'partial'); notice('采集未完成，请核对已保存原文。'); })
+          .finally(function () {
+            send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'end'});
+            if (copy.body && !copy.body.locked) copy.body.cancel().catch(function () {});
+            var i = contexts.indexOf(dctx); if (i >= 0) contexts.splice(i, 1);
+          });
+        return resp;
+      }, function (err) {
+        usersStatus(dctx, 'failed');
+        send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'end'});
+        var j = contexts.indexOf(dctx); if (j >= 0) contexts.splice(j, 1);
+        throw err;
+      });
+    }
     if (url.origin !== 'https://chatgpt.com') return originalFetch(input, init);
     // Logged-out anonymous chats use /backend-anon/*, logged-in use /backend-api/*.
     var match = url.pathname.match(/^\/(backend-api|backend-anon)\/(?:f\/)?conversation(?:\/([^/]+))?(?:\/(title))?\/?$/);
@@ -417,22 +555,44 @@
   };
 
   function captureDom() {
-    var nodes = window.document.querySelectorAll('[data-message-author-role]'), count = 0, parent = '';
     var cid = routeId() || activeId || localId;
-    Array.prototype.forEach.call(nodes, function (node) {
-      var role = node.getAttribute('data-message-author-role');
-      if (!/^(user|assistant)$/.test(role)) return;
-      var holder = node.closest('[data-message-id]');
-      var id = node.getAttribute('data-message-id') || holder && holder.getAttribute('data-message-id');
-      // No stable ID: do not invent identities that would duplicate network messages.
-      if (!id) return;
-      var body = node.querySelector('.markdown') || node;
-      var text = String(body.innerText || '').trim();
-      if (!text) return;
-      var m = {id: id, author: {role: role}, content: {parts: [text]}};
-      if (emit({cid: cid, time: Date.now()}, m, 'partial', 'dom', parent, false)) count++;
-      parent = id;
-    });
+    var count = 0, parent = '';
+    if (PLATFORM === 'deepseek') {
+      // DeepSeek DOM: message blocks live in the chat scroll area; role is inferred
+      // from the container classes since there are no data-message-* attributes.
+      // IDs are positional (chat id + index) so repeated补采集 dedupes safely.
+      var blocks = window.document.querySelectorAll(
+        'div[class*="ds-markdown"], div[class*="message-item"], div[class*="chat-message"]');
+      var seen = window.__chatnotesDsDom = window.__chatnotesDsDom || Object.create(null);
+      Array.prototype.forEach.call(blocks, function (node) {
+        var text = String(node.innerText || '').trim();
+        if (!text || text.length < 2) return;
+        var isUser = /(_user|user-message|human)/i.test(node.className) ||
+          (node.closest('div[class*="request"]') != null);
+        var key = (isUser ? 'u' : 'a') + ':' + text.slice(0, 80);
+        var id = seen[key];
+        if (!id) { id = seen[key] = 'dsdom-' + (Object.keys(seen).length + 1) + '-' + cid.slice(0, 8); }
+        var m = {id: id, author: {role: isUser ? 'user' : 'assistant'}, content: {parts: [text.slice(0, MAX_TEXT)]}};
+        if (emit({cid: cid, time: Date.now()}, m, 'partial', 'dom', parent, false)) count++;
+        parent = id;
+      });
+    } else {
+      var nodes = window.document.querySelectorAll('[data-message-author-role]');
+      Array.prototype.forEach.call(nodes, function (node) {
+        var role = node.getAttribute('data-message-author-role');
+        if (!/^(user|assistant)$/.test(role)) return;
+        var holder = node.closest('[data-message-id]');
+        var id = node.getAttribute('data-message-id') || holder && holder.getAttribute('data-message-id');
+        // No stable ID: do not invent identities that would duplicate network messages.
+        if (!id) return;
+        var body = node.querySelector('.markdown') || node;
+        var text = String(body.innerText || '').trim();
+        if (!text) return;
+        var m = {id: id, author: {role: role}, content: {parts: [text]}};
+        if (emit({cid: cid, time: Date.now()}, m, 'partial', 'dom', parent, false)) count++;
+        parent = id;
+      });
+    }
     if (count) {
       send({type: 'conversation', conversationId: cid, activeLeaf: parent, coverage: 'dom', url: currentUrl()});
       notice('已补采集页面中有稳定 ID 的可见消息；附件、折叠内容和未加载历史可能缺失。');
