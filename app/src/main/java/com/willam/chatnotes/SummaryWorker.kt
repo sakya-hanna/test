@@ -42,13 +42,14 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
                     "[消息 ${it.id}；${it.role}；状态 ${it.status}]\n${it.text}"
                 }
                 require(input.length <= 250000) { "会话超过本版自动整理上限（25 万字符）；原文已保存，可导出后分段整理" }
+                val promptExtra = graph.config.prefs.getString("prompt_extra", "") ?: ""
                 fun call(key: String, content: String, merge: Boolean): SummaryResult {
                     db.part(id, key)?.let { return SummaryResult.parse(it) }
                     if (isStopped) throw Paused()
                     // Checkpoint before approaching WorkManager's normal execution time budget.
                     if (callsThisRun >= 3 || System.currentTimeMillis() - started > 210000) throw Paused()
                     callsThisRun++
-                    val partial = api.summarize(content, merge, candidates)
+                    val partial = api.summarize(content, merge, candidates, promptExtra)
                     db.savePart(id, key, partial.json())
                     return partial
                 }

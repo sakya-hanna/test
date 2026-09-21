@@ -31,6 +31,7 @@ import java.util.Locale
 import java.util.Date
 import java.util.concurrent.RejectedExecutionException
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 class MainActivity : AppCompatActivity() {
@@ -75,6 +76,9 @@ class MainActivity : AppCompatActivity() {
     }
     private val exportPicker = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         if (uri != null) exportTo(uri)
+    }
+    private val importPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importFrom(uri)
     }
     private fun ui(action: () -> Unit) = runOnUiThread { if (!isFinishing && !isDestroyed) action() }
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
@@ -311,7 +315,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
     private fun showMenu() {
-        val actions = arrayOf("LLM 接口设置", "向量检索设置", "后台同步设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "重建语义索引", "回收站", "导出原文与笔记 ZIP")
+        val actions = arrayOf("LLM 接口设置", "向量检索设置", "后台同步设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "重建语义索引", "回收站", "导出原文与笔记 ZIP", "导入 ZIP 备份", "整理模板")
         AlertDialog.Builder(this).setTitle("ChatNotes").setItems(actions) { _, index ->
             when (index) {
                 0 -> showSettings()
@@ -335,6 +339,8 @@ class MainActivity : AppCompatActivity() {
                 7 -> rebuildSemanticIndex()
                 8 -> showTrash()
                 9 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
+                10 -> importPicker.launch(arrayOf("application/zip", "application/octet-stream"))
+                11 -> showPromptTemplate()
             }
         }.show()
     }
@@ -653,6 +659,51 @@ class MainActivity : AppCompatActivity() {
             dialog.show()
         }
     }
+    private fun importFrom(uri: Uri) {
+        val resolver = applicationContext.contentResolver
+        disk({
+            var notes = 0; var skipped = 0
+            val input = requireNotNull(resolver.openInputStream(uri)) { "无法读取文件" }
+            ZipInputStream(input.buffered()).use { zip ->
+                var e = zip.nextEntry
+                while (e != null) {
+                    if (e.name.startsWith("notes/") && e.name.endsWith(".md")) {
+                        val rel = e.name.removePrefix("notes/")
+                        if (rel.contains("..") || rel.startsWith(NoteAdmin.TRASH_DIR + "/")) { e = zip.nextEntry; continue }
+                        val dest = File(graph.notes.root, rel)
+                        if (dest.exists()) { skipped++ }
+                        else {
+                            dest.parentFile?.mkdirs()
+                            dest.outputStream().use { zip.copyTo(it) }
+                            notes++
+                        }
+                    }
+                    e = zip.nextEntry
+                }
+            }
+            graph.search.ensureIndexed(graph.notes, graph.db)
+            "导入 $notes 篇笔记${if (skipped > 0) "，跳过已存在 $skipped 篇" else ""}"
+        }, { msg -> toast(msg); render(); SyncWorker.enqueueAfterNoteChange(applicationContext) })
+    }
+
+    private fun showPromptTemplate() {
+        val input = EditText(this).apply {
+            setText(graph.config.prefs.getString("prompt_extra", "") ?: "")
+            hint = "例：笔记面向初学者，多解释术语；标题格式用「主题：细节」"
+            minLines = 4; gravity = android.view.Gravity.TOP; setSingleLine(false)
+        }
+        val wrap = ScrollView(this).apply { addView(input) }
+        AlertDialog.Builder(this).setTitle("整理模板（附加要求）")
+            .setMessage("以下文字会拼进整理提示词，影响生成的笔记风格与结构。留空使用默认。")
+            .setView(wrap)
+            .setPositiveButton("保存") { _, _ ->
+                disk({ graph.config.prefs.edit().putString("prompt_extra", input.text.toString().trim()).apply() }, {
+                    toast("模板已保存，之后的整理任务生效")
+                })
+            }
+            .setNegativeButton("取消", null).show()
+    }
+
     private fun exportTo(uri: Uri) {
         val resolver = applicationContext.contentResolver
         disk({
