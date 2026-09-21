@@ -126,6 +126,7 @@ class MainActivity : AppCompatActivity() {
         // Migration and unfinished job recovery run after the once-per-process capture recovery.
         disk({
             graph.db.jobs().filter { it.state in setOf("queued", "running", "writing") }.forEach { SummaryWorker.enqueue(graph.app, it.id) }
+            if (graph.config.syncConfig() != null) SyncWorker.enqueueOnAppOpen(applicationContext) // 打开 app 自动对账（设计 §12.6）
         }) { }
         WorkManager.getInstance(this).getWorkInfosByTagLiveData("chatnotes-summary").observe(this) {
             disk({ graph.db.jobs() }) { jobs ->
@@ -298,28 +299,29 @@ class MainActivity : AppCompatActivity() {
         }
     }
     private fun showMenu() {
-        val actions = arrayOf("LLM 接口设置", "向量检索设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "重建语义索引", "导出原文与笔记 ZIP")
+        val actions = arrayOf("LLM 接口设置", "向量检索设置", "后台同步设置", "已保存对话", "整理任务与重试", "补采集当前网页", "重建搜索索引", "重建语义索引", "导出原文与笔记 ZIP")
         AlertDialog.Builder(this).setTitle("ChatNotes").setItems(actions) { _, index ->
             when (index) {
                 0 -> showSettings()
                 1 -> showEmbedSettings()
-                2 -> showConversations()
-                3 -> showJobs()
-                4 -> {
+                2 -> showSyncSettings()
+                3 -> showConversations()
+                4 -> showJobs()
+                5 -> {
                     switchTab(true)
                     if (webViewDestroyed) showRendererRecovery()
                     else if (bridgeReady) webView.evaluateJavascript("window.__chatnotes && window.__chatnotes.captureDom()", null)
                     else toast("请先更新 Android System WebView")
                 }
-                5 -> {
+                6 -> {
                     toast("正在后台重建索引")
                     disk({ graph.search.rebuild(graph.notes, graph.db) }) { status ->
                         toast("索引完成：${status.indexedNotes} 篇笔记、${status.indexedConversations} 个对话${if (status.fts) "" else "（本机不支持 FTS5，已降级为子串匹配）"}")
                         render()
                     }
                 }
-                6 -> rebuildSemanticIndex()
-                7 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
+                7 -> rebuildSemanticIndex()
+                8 -> exportPicker.launch("ChatNotes-backup-${System.currentTimeMillis()}.zip")
             }
         }.show()
     }
@@ -361,6 +363,35 @@ class MainActivity : AppCompatActivity() {
                 show()
             }
     }
+
+    private fun showSyncSettings() {
+        val wrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 24, 40, 16) }
+        fun field(label: String, value: String, hint: String, type: Int): EditText {
+            wrap.addView(TextView(this).apply { text = label })
+            return EditText(this).apply { inputType = type; setText(value); this.hint = hint; wrap.addView(this) }
+        }
+        val prefs = graph.config.prefs
+        val url = field("后台同步地址（可留空关闭同步）", prefs.getString("sync_base_url", "") ?: "", "https://1.2.3.4:8443", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val token = field("同步令牌", runCatching { graph.config.syncToken() }.getOrDefault(""), "服务器 token.txt 的内容", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        AlertDialog.Builder(this).setTitle("后台同步设置").setView(ScrollView(this).apply { addView(wrap) })
+            .setPositiveButton("保存并立即同步", null).setNegativeButton("取消", null)
+            .setNeutralButton("清空配置") { _, _ ->
+                disk({ graph.config.saveSync("", "") }) { toast("已关闭后台同步，笔记仅存本机") }
+            }
+            .create().apply {
+                setOnShowListener { getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    disk({
+                        graph.config.saveSync(url.text.toString(), token.text.toString())
+                        SyncWorker.enqueueOnAppOpen(applicationContext)
+                    }) {
+                        dismiss()
+                        toast(if (graph.config.syncConfig() != null) "同步设置已保存，正在后台同步" else "已清空，笔记仅存本机")
+                    }
+                } }
+                show()
+            }
+    }
+
     private fun showConversations() {
         disk({ graph.db.conversations() }) { conversations ->
             if (conversations.isEmpty()) { toast("尚无已保存的原文"); return@disk }

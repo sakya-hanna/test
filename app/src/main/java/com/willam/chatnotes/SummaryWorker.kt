@@ -76,6 +76,8 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
                 "- 本笔记由模型整理，未经过事实核实；原文保存在本应用的会话记录中。\n"
             val file = graph.notes.writeNote(result, id, "# ${result.title}\n\n${result.markdown}$source")
             db.updateJob(id, "saved", note = file.absolutePath)
+            // 笔记有变更 → 触发增量同步（未配置同步时 SyncWorker 内部直接跳过）
+            SyncWorker.enqueueAfterNoteChange(applicationContext)
             return Result.success()
         } catch (_: Paused) {
             db.updateJob(id, "queued", error = "已保存处理进度，等待继续")

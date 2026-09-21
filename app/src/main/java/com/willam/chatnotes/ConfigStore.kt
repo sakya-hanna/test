@@ -4,12 +4,14 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import com.willam.chatnotes.shared.sync.SyncState
 import java.net.URI
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlinx.serialization.json.Json
 
 data class ApiConfig(val baseUrl: String, val apiKey: String, val model: String)
 
@@ -51,6 +53,54 @@ class ConfigStore(context: Context) {
     }
     fun read(): ApiConfig = ApiConfig(prefs.getString("base_url", "") ?: "", apiKey(), prefs.getString("model", "") ?: "")
         .also { validate(it.baseUrl, it.model) }
+
+    // ---- 后台同步配置（形态 A）：URL 明文，token 加密；状态为 JSON 快照 ----
+
+    fun syncConfig(): SyncConfig? {
+        val base = prefs.getString("sync_base_url", "") ?: ""
+        if (base.isBlank()) return null
+        val token = syncToken()
+        if (token.isBlank()) return null
+        return SyncConfig(base, token)
+    }
+
+    @Synchronized fun syncToken(): String {
+        if (prefs.contains("sync_token")) {
+            val old = prefs.getString("sync_token", "") ?: ""
+            check(prefs.edit().putString("sync_token_encrypted", encrypted(old)).remove("sync_token").commit()) {
+                "同步令牌迁移失败"
+            }
+        }
+        val encoded = prefs.getString("sync_token_encrypted", "") ?: ""
+        if (encoded.isEmpty()) return ""
+        return try {
+            val bytes = Base64.decode(encoded, Base64.NO_WRAP)
+            require(bytes.size > 12)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+            String(cipher.doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8)
+        } catch (e: Exception) { throw IllegalStateException("无法解密同步令牌，请在设置中重新输入", e) }
+    }
+
+    @Synchronized fun saveSync(baseUrl: String, token: String) {
+        check(prefs.edit().putString("sync_base_url", baseUrl.trim()).putString("sync_token_encrypted", encrypted(token)).remove("sync_token").commit()) {
+            "同步设置保存失败"
+        }
+    }
+
+    fun syncCursor(): Long = java.lang.Long.parseLong(prefs.getString("sync_cursor", "0") ?: "0")
+
+    fun syncState(): SyncState = try {
+        val raw = prefs.getString("sync_state", "") ?: ""
+        if (raw.isEmpty()) SyncState() else Json.decodeFromString(SyncState.serializer(), raw)
+    } catch (e: Exception) { SyncState() }
+
+    fun saveSyncState(state: SyncState) {
+        prefs.edit()
+            .putString("sync_state", Json.encodeToString(SyncState.serializer(), state))
+            .putString("sync_cursor", state.cursor.toString())
+            .apply()
+    }
 
     // ---- embedding service config (stage 2) ----
     @Synchronized fun embedApiKey(): String {
