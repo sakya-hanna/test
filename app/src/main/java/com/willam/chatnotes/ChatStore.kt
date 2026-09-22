@@ -247,6 +247,9 @@ class ChatStore(context: Context, name: String = "chatnotes.db") : SQLiteOpenHel
     @Synchronized fun job(id: String): SummaryJob? = readableDatabase.rawQuery(
         "SELECT id,cid,snapshot,state,draft,note_path,error FROM jobs WHERE id=?", arrayOf(id)
     ).use { if (it.moveToFirst()) SummaryJob(it.getString(0), it.getString(1), it.getString(2), it.getString(3), it.getString(4), it.getString(5), it.getString(6)) else null }
+    @Synchronized fun parts(jobId: String): Int = readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM summary_parts WHERE job=?", arrayOf(jobId)
+    ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
     @Synchronized fun jobs(): List<SummaryJob> = readableDatabase.rawQuery("SELECT id FROM jobs ORDER BY created DESC", null)
         .use { c -> buildList { while (c.moveToNext()) job(c.getString(0))?.let { add(it) } } }
     @Synchronized fun updateJob(id: String, state: String, draft: String? = null, note: String? = null, error: String = "") {

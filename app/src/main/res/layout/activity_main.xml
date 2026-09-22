@@ -96,6 +96,14 @@
                         android:text="旁听中 · 本次已捕获 0 条消息"
                         android:textSize="11sp"
                         android:textColor="#10A37F" />
+
+                    <TextView
+                        android:id="@+id/jobInfo"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textSize="11sp"
+                        android:textColor="#10A37F"
+                        android:visibility="gone" />
                 </LinearLayout>
 
                 <ImageButton

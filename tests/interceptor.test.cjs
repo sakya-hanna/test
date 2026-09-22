@@ -260,3 +260,100 @@ test('thinking frames are not captured as attachment placeholders',async()=>{
   // clean stream -> complete, not partial
   assert.equal(finals(sent).at(-1).status,'complete');
 });
+
+// ---- DeepSeek: XHR + SSE patch stream（帧形状来自 2026-09 真机 CDP 抓包）----
+function installDeepseek(fetch, href='https://chat.deepseek.com/a/chat/s/c1', nodes=[]) {
+  const sent=[]; const listeners={};
+  const window={fetch,location:{href},crypto:{randomUUID:require('node:crypto').randomUUID},
+    history:{pushState(){},replaceState(){}},document:{querySelectorAll(){return nodes;}},
+    addEventListener(k,v){listeners[k]=v;},chatnotesProxy:{postMessage(s){sent.push(JSON.parse(s));}}};
+  window.top=window;
+  function XMLHttpRequest(){}
+  XMLHttpRequest.prototype.open=function(method,url){this.__cnUrl=String(url);this.__cnMethod=method;};
+  XMLHttpRequest.prototype.addEventListener=function(k,v){(this.__cnL=this.__cnL||{})[k]=(this.__cnL[k]||[]).concat(v);};
+  XMLHttpRequest.prototype.send=function(body){
+    this.__cnBody=body;
+    const self=this;
+    // setImmediate 与 settle() 的轮询同一队列，触发时机确定（setTimeout 是宏任务，会竞态）
+    setImmediate(()=>{
+      self.responseText=self.__cnRsp||'';
+      ((self.__cnL||{}).load||[]).forEach(f=>f());
+      ((self.__cnL||{}).loadend||[]).forEach(f=>f());
+    });
+  };
+  window.XMLHttpRequest=XMLHttpRequest;
+  vm.runInNewContext(source,{window,XMLHttpRequest,URL,TextDecoder,setTimeout,clearTimeout,
+    setInterval:()=>0,clearInterval(){},Promise,Date,console});
+  return {window,sent,listeners};
+}
+function dsStream(frames){ return frames.map(f=>'data: '+JSON.stringify(f)+'\n\n').join(''); }
+function dsFinals(sent){ return sent.filter(e=>e.type==='message'&&e.role==='assistant'); }
+function dsRequest(prompt, sid='c1', parent=2){
+  return JSON.stringify({chat_session_id:sid,parent_message_id:parent,model_type:null,prompt,
+    ref_file_ids:[],thinking_enabled:false,search_enabled:true,action:null,preempt:false});
+}
+function dsSend(window,rsp,reqBody){
+  const xhr=new window.XMLHttpRequest();
+  xhr.__cnRsp=rsp;
+  xhr.open('POST','https://chat.deepseek.com/api/v0/chat/completion');
+  xhr.send(reqBody);
+}
+
+test('deepseek: prompt question and patch-stream reply captured from network',async()=>{
+  const {window,sent}=installDeepseek(async()=>new Response(''));
+  dsSend(window,dsStream([
+    {request_message_id:5,response_message_id:6,model_type:'default'},
+    {updated_at:1790044441.5},
+    {v:{response:{message_id:6,role:'ASSISTANT',status:'WIP',fragments:[{id:2,type:'SEARCH',content:''}]}}},
+    {p:'response/fragments/-1',o:'BATCH',v:[{p:'status',v:'FINISHED'},{p:'content',v:'搜索到 20 个网页'}]},
+    {p:'response',o:'BATCH',v:[{p:'fragments',o:'APPEND',v:[{id:3,type:'RESPONSE',content:'搭建'}]},{p:'has_pending_fragment',o:'SET',v:false}]},
+    {p:'response/fragments/-1/content',o:'APPEND',v:'AI 平台'},
+    {v:'的步骤'},
+    {p:'response/status',o:'SET',v:'FINISHED'}
+  ]),dsRequest('什么是容器编排'));
+  await settle();
+  const msgs=sent.filter(e=>e.type==='message');
+  const user=msgs.find(m=>m.role==='user');
+  assert.ok(user);assert.equal(user.text,'什么是容器编排');
+  assert.equal(user.source,'network');assert.equal(user.conversationId,'c1');
+  // SEARCH 片段的元数据文本不得混进回答
+  assert.ok(!msgs.some(m=>m.text.includes('搜索到')));
+  assert.equal(dsFinals(sent).at(-1).text,'搭建AI 平台的步骤');
+  assert.equal(dsFinals(sent).at(-1).source,'network');
+  assert.equal(dsFinals(sent).at(-1).status,'complete');
+  assert.equal(sent.filter(e=>e.type==='request').at(-1).state,'end');
+});
+test('deepseek: reply-less stream keeps the question and falls back to DOM notice',async()=>{
+  const {window,sent}=installDeepseek(async()=>new Response(''));
+  dsSend(window,'data: {"updated_at":1}\n\ndata: {"click_behavior":"none"}\n\n',dsRequest('这次没有回答'));
+  await settle();
+  const msgs=sent.filter(e=>e.type==='message');
+  assert.ok(msgs.some(m=>m.role==='user'&&m.text==='这次没有回答'&&m.source==='network'));
+  assert.equal(msgs.filter(m=>m.role==='assistant').length,0);
+  assert.ok(sent.some(e=>e.type==='notice'));
+});
+test('deepseek: new conversation remaps local id via chat_session_id',async()=>{
+  const {window,sent}=installDeepseek(async()=>new Response(''),'https://chat.deepseek.com/');
+  dsSend(window,dsStream([
+    {v:{response:{message_id:9,role:'ASSISTANT',status:'WIP',fragments:[]}}},
+    {p:'response',o:'BATCH',v:[{p:'fragments',o:'APPEND',v:[{id:4,type:'RESPONSE',content:'新会话的回答'}]}]},
+    {p:'response/fragments/-1/status',o:'SET',v:'FINISHED'}
+  ]),dsRequest('新建对话提问','srv9'));
+  await settle();
+  const remap=sent.find(e=>e.type==='remap');
+  assert.ok(remap);assert.ok(remap.from.startsWith('local:'));assert.equal(remap.to,'srv9');
+  const msgs=sent.filter(e=>e.type==='message');
+  assert.ok(msgs.length>0&&msgs.every(m=>m.conversationId==='srv9'));
+  assert.equal(dsFinals(sent).at(-1).text,'新会话的回答');
+  assert.equal(dsFinals(sent).at(-1).status,'complete');
+});
+test('deepseek: patches landing before any fragment still form the answer',async()=>{
+  const {window,sent}=installDeepseek(async()=>new Response(''));
+  dsSend(window,dsStream([
+    {p:'response/fragments/-1/content',o:'APPEND',v:'直接开始'},
+    {p:'response/status',o:'SET',v:'FINISHED'}
+  ]),dsRequest('极端顺序'));
+  await settle();
+  assert.equal(dsFinals(sent).at(-1).text,'直接开始');
+  assert.equal(dsFinals(sent).at(-1).status,'complete');
+});

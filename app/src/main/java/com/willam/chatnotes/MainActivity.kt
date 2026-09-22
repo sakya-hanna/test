@@ -41,6 +41,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chatScreen: View
     private lateinit var notesScreen: View
     private lateinit var captureInfo: TextView
+    private lateinit var jobInfo: TextView
     private lateinit var pathBar: LinearLayout
     private lateinit var listBox: LinearLayout
     private lateinit var searchInput: EditText
@@ -72,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     private var rateCount = 0
     private var observedJobs = false
     private val savedJobs = mutableSetOf<String>()
+    private val knownFailed = mutableSetOf<String>()
     private val captureOwner = java.util.UUID.randomUUID().toString()
     private var acceptingCapture = true
     private var webViewDestroyed = false
@@ -114,7 +116,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         graph = AppGraph.get(this); markwon = Markwon.create(this)
         chatScreen = findViewById(R.id.chatScreen); notesScreen = findViewById(R.id.notesScreen)
-        captureInfo = findViewById(R.id.captureInfo); pathBar = findViewById(R.id.pathBar)
+        captureInfo = findViewById(R.id.captureInfo); jobInfo = findViewById(R.id.jobInfo); pathBar = findViewById(R.id.pathBar)
         listBox = findViewById(R.id.listBox); searchInput = findViewById(R.id.searchInput)
         scrollView = findViewById(R.id.browseScroll); detailScroll = findViewById(R.id.detailScroll)
         detailBody = findViewById(R.id.detailBody)
@@ -145,10 +147,31 @@ class MainActivity : AppCompatActivity() {
             if (graph.config.syncConfig() != null) SyncWorker.enqueueOnAppOpen(applicationContext) // 打开 app 自动对账（设计 §12.6）
         }) { }
         WorkManager.getInstance(this).getWorkInfosByTagLiveData("chatnotes-summary").observe(this) {
-            disk({ graph.db.jobs() }) { jobs ->
+            disk({
+                val jobs = graph.db.jobs()
+                val single = jobs.singleOrNull { it.state in setOf("queued", "running", "writing") }
+                jobs to (single?.let { graph.db.parts(it.id) } ?: 0)
+            }) { (jobs, parts) ->
                 val completed = jobs.filter { it.state == "saved" }.map { it.id }.toSet()
                 if (observedJobs && (completed - savedJobs).isNotEmpty()) { toast("笔记已归档，可在知识库中查看"); render() }
                 savedJobs.addAll(completed); observedJobs = true
+                val active = jobs.filter { it.state in setOf("queued", "running", "writing") }
+                val failed = jobs.filter { it.state == "failed" }
+                if (observedJobs) failed.firstOrNull { it.id !in knownFailed }?.let {
+                    toast("整理失败：${it.error.ifBlank { "原因未知" }}，可在菜单“整理任务与重试”里重试")
+                }
+                knownFailed.addAll(failed.map { it.id })
+                if (active.isEmpty() && failed.isEmpty()) {
+                    jobInfo.visibility = View.GONE
+                } else {
+                    jobInfo.visibility = View.VISIBLE
+                    jobInfo.text = when {
+                        active.isEmpty() -> "上次整理失败，可在菜单“整理任务与重试”里重试"
+                        failed.isEmpty() && active.size == 1 -> "整理中 · 已完成 $parts 段"
+                        else -> "整理中 ${active.size} 个任务" + if (failed.isNotEmpty()) " · 失败 ${failed.size} 个，见菜单" else ""
+                    }
+                    jobInfo.setTextColor(if (active.isEmpty()) Color.rgb(170, 80, 0) else Color.rgb(0, 130, 85))
+                }
             }
         }
         render()
@@ -695,12 +718,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
     private fun showJobs() {
-        disk({ graph.db.jobs() }) { jobs ->
+        disk({ graph.db.jobs().map { it to graph.db.parts(it.id) } }) { jobs ->
             if (jobs.isEmpty()) { toast("暂无整理任务"); return@disk }
             val labels = mapOf("queued" to "等待继续", "running" to "整理中", "writing" to "保存中", "failed" to "失败，可重试", "saved" to "已归档")
             AlertDialog.Builder(this).setTitle("整理任务")
-                .setItems(jobs.map { "${labels[it.state] ?: it.state} · ${runCatching { JSONObject(it.snapshot).text("title") }.getOrDefault("会话")}" }.toTypedArray()) { _, index ->
-                    val job = jobs[index]
+                .setItems(jobs.map { (job, parts) ->
+                    val progress = if (job.state in setOf("running", "writing", "queued") && parts > 0) " · 已完成 $parts 段" else ""
+                    "${labels[job.state] ?: job.state}$progress · ${runCatching { JSONObject(job.snapshot).text("title") }.getOrDefault("会话")}"
+                }.toTypedArray()) { _, index ->
+                    val (job, _) = jobs[index]
                     when {
                         job.state == "saved" -> AlertDialog.Builder(this).setTitle("已归档")
                             .setMessage("这份原文快照已整理成笔记。可以基于同一份原文重新整理为一份新笔记（原笔记保留）。")

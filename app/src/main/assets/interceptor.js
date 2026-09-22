@@ -254,81 +254,97 @@
       status: final ? 'complete' : 'streaming', sentAt: old ? old.sentAt : 0};
     if (final || !old || Date.now() - item.sentAt >= 400) publish(ctx, item, item.status);
   }
-  // ---- DeepSeek: XHR + NDJSON fragment stream ----
-  // The DeepSeek web app sends chat requests via XMLHttpRequest (not fetch), so we
-  // wrap XMLHttpRequest.send/open. Response is a JSON-lines chunk sequence.
-  var originalOpen = XMLHttpRequest.prototype.open;
-  var originalSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function (method, url) {
-    this.__cnUrl = String(url || '');
-    return originalOpen.apply(this, arguments);
-  };
-  XMLHttpRequest.prototype.send = function (body) {
-    var xhr = this;
-    var isCompletion = false;
-    try {
-      var u = new URL(xhr.__cnUrl, currentUrl());
-      isCompletion = u.origin === 'https://chat.deepseek.com' &&
-        /^\/api\/v0\/chat\/completion/.test(u.pathname) &&
-        String(xhr.__cnMethod || 'POST').toUpperCase() !== 'GET';
-    } catch (_) { isCompletion = false; }
-    if (!isCompletion) return originalSend.apply(this, arguments);
-    var dctx = {cid: activeId || localId, token: uid('req:'), users: [], answers: Object.create(null),
-      parent: '', time: Date.now(), unknown: 0};
-    contexts.push(dctx);
-    send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'start'});
-    // 提问内容：请求体里带 messages（用户消息在最后），先解析出 user 消息。
-    function prepareUsers() {
-      try {
-        if (!body) return;
-        var j = typeof body === 'string' ? JSON.parse(body) : null;
-        if (!j) return;
-        var msgs = j.messages || (j.body && j.body.messages) || [];
-        msgs.forEach(function (m) {
-          if ((m.role || '') !== 'user') return;
-          var t = deepseekText(m.content);
-          if (!t.trim()) return;
-          var user = {id: uid('request:'), author: {role: 'user'}, content: {parts: [t]}};
-          dctx.users.push({message: user, parent: ''});
-          emit(dctx, user, 'pending', 'network', '', true);
-        });
-      } catch (_) { /* 请求体格式变化时静默，DOM 兜底 */ }
-    }
-    xhr.addEventListener('load', function () {
-      try {
-        var text = String(xhr.responseText || '');
-        if (!text) { usersStatus(dctx, 'failed'); return; }
-        usersStatus(dctx, 'complete');
-        // NDJSON 或整体 JSON 都试解
-        var frags = [];
-        try {
-          text.split('\n').forEach(function (line) {
-            line = line.trim();
-            if (!line || line === '[DONE]') return;
-            if (line.indexOf('data:') === 0) line = line.slice(5).replace(/^\s/, '');
-            frags.push(JSON.parse(line));
-          });
-        } catch (_) {
-          try { frags = [JSON.parse(text)]; } catch (_e) { dctx.unknown++; }
-        }
-        frags.forEach(function (frag) { deepseekApply(dctx, frag); });
-        flush(dctx, dctx.unsupported ? 'partial' : 'complete');
-        if (!Object.keys(dctx.answers).length) {
-          notice('回复未从网络捕获，已用页面补采集核对。');
-          captureDom();
-        }
-      } catch (_) { flush(dctx, 'partial'); notice('回复采集出错，已保存收到的内容。'); }
-    });
-    xhr.addEventListener('error', function () { usersStatus(dctx, 'failed'); });
-    var done = function () {
-      send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'end'});
-      var i = contexts.indexOf(dctx); if (i >= 0) contexts.splice(i, 1);
+  // ---- DeepSeek: XHR + SSE patch stream ----
+  // 真机 CDP 抓包实锤（2026-09）：请求经 XMLHttpRequest POST /api/v0/chat/completion，
+  // 请求体平铺 {chat_session_id, parent_message_id, prompt, ...}（没有 messages 数组）。
+  // 响应 application/x-ndjson 实为 SSE：行 "event: ready|update_session|close" + "data: {...}"。
+  // data 帧四种形态：
+  //   1) ready 帧 {request_message_id, response_message_id, model_type}
+  //   2) 全量快照 {"v": {response: {...fragments[]}}}（仅流首）
+  //   3) 隐式追加 {"v": "文本"}——向当前 RESPONSE 片段追加正文（流的主体形态）
+  //   4) 显式补丁 {"p": 路径, "o": APPEND|SET|BATCH, "v": ...}；p 以 -1 结尾指向末尾片段；
+  //      BATCH 的 v 是子补丁数组；o 省略时按 SET；无 p 无 o 只有 v 的 dict 不是补丁（忽略）
+  // WebView 一定有 XMLHttpRequest；守卫只为测试沙箱与极端环境不炸整个采集脚本。
+  if (typeof XMLHttpRequest !== 'undefined') {
+    var originalOpen = XMLHttpRequest.prototype.open;
+    var originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__cnUrl = String(url || '');
+      this.__cnMethod = method;
+      return originalOpen.apply(this, arguments);
     };
-    xhr.addEventListener('loadend', done);
-    prepareUsers();
-    send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'start'});
-    return originalSend.apply(this, arguments);
-  };
+    XMLHttpRequest.prototype.send = function (body) {
+      var xhr = this;
+      var isCompletion = false;
+      try {
+        var u = new URL(xhr.__cnUrl, currentUrl());
+        isCompletion = u.origin === 'https://chat.deepseek.com' &&
+          /^\/api\/v0\/chat\/completion/.test(u.pathname) &&
+          String(xhr.__cnMethod || 'POST').toUpperCase() !== 'GET';
+      } catch (_) { isCompletion = false; }
+      if (!isCompletion) return originalSend.apply(this, arguments);
+      var dctx = {cid: activeId || localId, token: uid('req:'), users: [], answers: Object.create(null),
+        parent: '', time: Date.now(), unknown: 0, ds: {list: [], global: '', seq: 0}};
+      contexts.push(dctx);
+      // 提问内容：请求体平铺 prompt 字段；chat_session_id 直接给真实会话 id。
+      try {
+        if (typeof body === 'string' && body) {
+          var req = JSON.parse(body);
+          if (req.chat_session_id) {
+            var rid0 = String(req.chat_session_id);
+            if (rid0 !== dctx.cid) {
+              if (dctx.cid.indexOf('local:') === 0) bind(dctx, rid0);
+              else dctx.cid = rid0;
+            }
+          }
+          if (req.prompt && String(req.prompt).trim()) {
+            var user = {id: 'dsreq-' + String(req.parent_message_id || ++dctx.ds.seq) + '-' + dctx.token.slice(8, 20),
+              author: {role: 'user'}, content: {parts: [String(req.prompt).slice(0, MAX_TEXT)]}};
+            dctx.users.push({message: user, parent: ''});
+            emit(dctx, user, 'pending', 'network', '', true);
+          }
+        }
+      } catch (_) { /* 请求体格式变化时静默，DOM 兜底 */ }
+      send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'start'});
+      xhr.addEventListener('load', function () {
+        try {
+          var text = String(xhr.responseText || '');
+          if (!text) { usersStatus(dctx, 'failed'); return; }
+          usersStatus(dctx, 'complete');
+          // 响应 MIME 标 x-ndjson，实为 SSE：只解析 data: 行（event: 行无载荷）。
+          String(text).split('\n').forEach(function (row) {
+            row = row.replace(/\r$/, '');
+            if (row.indexOf('data:') !== 0) return;
+            var payload = row.slice(5);
+            if (payload.charAt(0) === ' ') payload = payload.slice(1);
+            try { deepseekFrame(dctx, JSON.parse(payload)); }
+            catch (_) { dctx.unknown++; }
+          });
+          var answers = dctx.ds.list.filter(function (fr) { return fr.type === 'RESPONSE' && fr.content.trim(); });
+          if (answers.length) {
+            answers.forEach(function (fr) {
+              var st = dctx.answers[fr.id];
+              if (!st) { st = dctx.answers[fr.id] = {id: fr.id, role: 'assistant', content: '', final: false, sentAt: 0, parent: ''}; }
+              st.content = fr.content;
+              st.final = String(fr.status || '').toUpperCase() === 'FINISHED' || dctx.ds.global === 'FINISHED';
+              deepseekEmit(dctx, st);
+            });
+            flush(dctx, dctx.unsupported ? 'partial' : 'complete');
+          } else {
+            notice('回复未从网络捕获，已用页面补采集核对。');
+            captureDom();
+          }
+        } catch (_) { flush(dctx, 'partial'); notice('回复采集出错，已保存收到的内容。'); }
+      });
+      xhr.addEventListener('error', function () { usersStatus(dctx, 'failed'); });
+      var done = function () {
+        send({type: 'request', conversationId: dctx.cid, requestId: dctx.token, state: 'end'});
+        var i = contexts.indexOf(dctx); if (i >= 0) contexts.splice(i, 1);
+      };
+      xhr.addEventListener('loadend', done);
+      return originalSend.apply(this, arguments);
+    };
+  }
   function deepseekText(obj) {
     // Accept string content or {text: "..."} / {content: "..."} shapes seen in fragments.
     if (!obj) return '';
@@ -345,26 +361,89 @@
     var m = {id: item.id || uid('ds:'), author: {role: item.role || 'assistant'}, content: {parts: [text]}};
     if (emit(ctx, m, item.final ? 'complete' : 'streaming', 'network', item.parent || '', true)) networkMessages++;
   }
-  function deepseekApply(ctx, frag) {
-    // Fragment shapes (tolerant): {v: {message: {id, role, content...}, ...}} n-th patch deltas,
-    // or flat {message_id/content} fields. Accumulate text per message id.
-    var msg = frag && frag.v && frag.v.message ? frag.v.message
-      : (frag && frag.message) || (frag && frag.v && frag.v.message_content ? frag.v : null);
-    if (!msg) { ctx.unknown++; return; }
-    var id = String(msg.id || msg.message_id || 'ds');
-    var role = msg.role || (msg.author && msg.author.role) || 'assistant';
-    var piece = deepseekText(msg.content !== undefined ? msg.content : msg);
-    var fin = frag.v ? (frag.v.finish_reason === 'stop' || !!frag.v.done || frag.v.status === 'finished') : true;
-    var st = ctx.answers[id];
-    if (!st) {
-      st = ctx.answers[id] = {id: id, role: role, content: '', final: false, sentAt: 0, parent: ''};
-    }
-    if (piece) st.content += piece;
-    if (fin) st.final = true;
-    if (st.final || Date.now() - st.sentAt >= 400) {
-      deepseekEmit(ctx, st); st.sentAt = Date.now();
-    }
+  function dsImport(f) {
+    return {id: String(f.id), type: String(f.type || ''),
+      content: typeof f.content === 'string' ? f.content : '', status: String(f.status || '')};
   }
+  function dsLast(ctx) { return ctx.ds.list.length ? ctx.ds.list[ctx.ds.list.length - 1] : null; }
+  function dsEnsure(ctx, id) {
+    var found = null;
+    for (var i = 0; i < ctx.ds.list.length; i++) {
+      if (ctx.ds.list[i].id === String(id)) { found = ctx.ds.list[i]; break; }
+    }
+    if (!found) { found = dsImport({id: id}); ctx.ds.list.push(found); }
+    return found;
+  }
+  function deepseekFrame(ctx, fr) {
+    if (!fr || typeof fr !== 'object') { ctx.unknown++; return; }
+    // ready 帧：本轮服务端消息编号（request=用户、response=回复）。
+    if (fr.request_message_id !== undefined && fr.response_message_id !== undefined) return;
+    // 隐式追加帧 {"v":"文本"}：向数组最后一个片段追加（不分类型——开思考/搜索时
+    // 文本可能先进 THINK/SEARCH 片段，RESPONSE 建立后自然切过去）；空数组才自建。
+    if (fr.hasOwnProperty('v') && !fr.hasOwnProperty('p') && !fr.hasOwnProperty('o')) {
+      var v = fr.v;
+      if (typeof v === 'string' && v) {
+        var cur = dsLast(ctx);
+        if (!cur) { cur = dsImport({id: 'implicit-' + ctx.token}); cur.type = 'RESPONSE'; ctx.ds.list.push(cur); }
+        cur.content += v;
+        return;
+      }
+      if (v && typeof v === 'object') {
+        // 全量快照（仅流首）：response.fragments 是权威状态。
+        var resp = v.response || null;
+        if (resp && Array.isArray(resp.fragments)) {
+          ctx.ds.list = resp.fragments.map(dsImport);
+          return;
+        }
+      }
+      ctx.unknown++;
+      return;
+    }
+    if (fr.hasOwnProperty('p')) {
+      // 显式补丁帧 {"p":路径,"o":APPEND|SET|BATCH,"v":...}；缺省 o=SET，BATCH 递归子补丁。
+      function dsSub(prefix, op) {
+        var childP = op && typeof op.p === 'string' ? op.p : '';
+        var full = childP ? (prefix ? prefix + '/' + childP : childP) : prefix;
+        if (op && op.o === 'BATCH' && Array.isArray(op.v)) {
+          op.v.forEach(function (sub) { dsSub(full, sub); });
+          return;
+        }
+        var kind = String(op && op.o || 'SET').toUpperCase();
+        var val = op ? op.v : undefined;
+        if (full === 'response/status') {
+          if (typeof val === 'string') ctx.ds.global = val;
+          return;
+        }
+        if (full === 'response/fragments' || full === 'fragments') {
+          // 新片段追加：页面在此建立 RESPONSE/THINK 片段。
+          if (kind === 'APPEND' && Array.isArray(val)) {
+            val.forEach(function (f) { if (f && f.id !== undefined) ctx.ds.list.push(dsImport(f)); });
+          }
+          return;
+        }
+        var tgt = null, prop = '';
+        var segs = full.split('/');
+        var fi = segs.indexOf('fragments');
+        if (fi >= 0 && segs[fi + 1] === '-1') {
+          // -1 = 数组最后一个片段（真实流恒定用法；中间路径同样适用）。
+          tgt = dsLast(ctx);
+          if (!tgt) { tgt = dsImport({id: 'implicit-' + ctx.token}); tgt.type = 'RESPONSE'; ctx.ds.list.push(tgt); }
+          prop = segs[fi + 2] || 'content';
+        } else if (fi >= 0) {
+          tgt = dsEnsure(ctx, segs[fi + 1]);
+          prop = segs[fi + 2] || 'content';
+        } else return; // 会话模式等与正文无关的路径
+        if (prop === 'content') { if (kind === 'APPEND') { if (typeof val === 'string') tgt.content += val; } else if (typeof val === 'string') tgt.content = val; }
+        else if (prop === 'status') { if (typeof val === 'string') tgt.status = val; }
+        else if (prop === 'type') { if (typeof val === 'string') tgt.type = val; }
+        // 其他属性（results/references/stage_id 等）与采集无关。
+      }
+      dsSub('', fr);
+      return;
+    }
+    // update_session / click_behavior / 其他控制帧：忽略。
+  }
+
   async function observeStream(resp, ctx) {
     var reader = resp.body.getReader(), decoder = new TextDecoder(), buffer = '', data = [];
     ctx.cancelObserver = function () { reader.cancel().catch(function () {}); };
