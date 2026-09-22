@@ -99,6 +99,32 @@ data class HelloRequest(
     val appVersion: String,
 )
 
+/** 配置备份（单用户）：LLM 与 embedding 两段配置 + 时间戳；key 明文传输（HTTPS 与同步 token 同信任级） */
+@Serializable
+data class AppConfigDto(
+    val llmBaseUrl: String = "",
+    val llmModel: String = "",
+    val llmApiKey: String = "",
+    val embedBaseUrl: String = "",
+    val embedModel: String = "",
+    val embedApiKey: String = "",
+    /** 端上最近一次修改时间，LWW 依据 */
+    val updatedAt: Long = 0,
+)
+
+@Serializable
+data class AppConfigSaveRequest(
+    val deviceId: String,
+    val config: AppConfigDto,
+)
+
+@Serializable
+data class AppConfigResponse(
+    val config: AppConfigDto,
+    /** 本次 save 是否被服务器接受（false=服务器更新，已返回服务器版本） */
+    val applied: Boolean = true,
+)
+
 @Serializable
 data class HelloResponse(
     val serverVersion: String,

@@ -1,5 +1,6 @@
 package com.willam.chatnotes.server
 
+import com.willam.chatnotes.shared.sync.AppConfigDto
 import java.sql.Connection
 import java.sql.DriverManager
 
@@ -105,6 +106,67 @@ class SyncStore(dbUrl: String) : AutoCloseable {
         }
         logChange(kind, docId, deleted = false)
         return "new"
+    }
+
+    /** 配置备份表（单行）：LLM/embed 两段配置整存整取 */
+    init {
+        conn.createStatement().use { st ->
+            st.execute(
+                """CREATE TABLE IF NOT EXISTS app_config(
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                llm_base_url TEXT NOT NULL DEFAULT '',
+                llm_model TEXT NOT NULL DEFAULT '',
+                llm_api_key TEXT NOT NULL DEFAULT '',
+                embed_base_url TEXT NOT NULL DEFAULT '',
+                embed_model TEXT NOT NULL DEFAULT '',
+                embed_api_key TEXT NOT NULL DEFAULT '',
+                updated_at BIGINT NOT NULL DEFAULT 0
+            )"""
+            )
+        }
+    }
+
+    /** 读配置备份；从未保存过时返回全空 + updatedAt=0 */
+    @Synchronized
+    fun getConfig(): AppConfigDto = conn.createStatement().use { st ->
+        st.executeQuery("SELECT llm_base_url, llm_model, llm_api_key, embed_base_url, embed_model, embed_api_key, updated_at FROM app_config WHERE id = 1")
+            .use { rs ->
+                if (rs.next()) AppConfigDto(
+                    llmBaseUrl = rs.getString(1) ?: "", llmModel = rs.getString(2) ?: "", llmApiKey = rs.getString(3) ?: "",
+                    embedBaseUrl = rs.getString(4) ?: "", embedModel = rs.getString(5) ?: "", embedApiKey = rs.getString(6) ?: "",
+                    updatedAt = rs.getLong(7),
+                ) else AppConfigDto()
+            }
+    }
+
+    /** 保存配置备份（LWW：入参 updatedAt 更新才落库）。返回 applied 与当前生效配置。 */
+    @Synchronized
+    fun saveConfig(c: AppConfigDto): Pair<Boolean, AppConfigDto> {
+        val current = getConfig()
+        if (c.updatedAt <= current.updatedAt) return false to current
+        if (isPg) {
+            conn.prepareStatement(
+                """INSERT INTO app_config(id,llm_base_url,llm_model,llm_api_key,embed_base_url,embed_model,embed_api_key,updated_at)
+                   VALUES (1,?,?,?,?,?,?,?)
+                   ON CONFLICT (id) DO UPDATE SET llm_base_url=EXCLUDED.llm_base_url, llm_model=EXCLUDED.llm_model,
+                     llm_api_key=EXCLUDED.llm_api_key, embed_base_url=EXCLUDED.embed_base_url,
+                     embed_model=EXCLUDED.embed_model, embed_api_key=EXCLUDED.embed_api_key, updated_at=EXCLUDED.updated_at"""
+            ).use { ps ->
+                ps.setString(1, c.llmBaseUrl); ps.setString(2, c.llmModel); ps.setString(3, c.llmApiKey)
+                ps.setString(4, c.embedBaseUrl); ps.setString(5, c.embedModel); ps.setString(6, c.embedApiKey)
+                ps.setLong(7, c.updatedAt); ps.executeUpdate()
+            }
+        } else {
+            conn.prepareStatement(
+                """INSERT OR REPLACE INTO app_config(id,llm_base_url,llm_model,llm_api_key,embed_base_url,embed_model,embed_api_key,updated_at)
+                   VALUES (1,?,?,?,?,?,?,?)"""
+            ).use { ps ->
+                ps.setString(1, c.llmBaseUrl); ps.setString(2, c.llmModel); ps.setString(3, c.llmApiKey)
+                ps.setString(4, c.embedBaseUrl); ps.setString(5, c.embedModel); ps.setString(6, c.embedApiKey)
+                ps.setLong(7, c.updatedAt); ps.executeUpdate()
+            }
+        }
+        return true to c
     }
 
     @Synchronized

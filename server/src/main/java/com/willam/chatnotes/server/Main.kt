@@ -1,5 +1,7 @@
 package com.willam.chatnotes.server
 
+import com.willam.chatnotes.shared.sync.AppConfigResponse
+import com.willam.chatnotes.shared.sync.AppConfigSaveRequest
 import com.willam.chatnotes.shared.sync.DeleteRequest
 import com.willam.chatnotes.shared.sync.DeleteResponse
 import com.willam.chatnotes.shared.sync.DocKind
@@ -111,6 +113,18 @@ input{padding:6px;width:60%}button{padding:6px 14px}.m{color:#888;font-size:12px
         }
 
         authenticate("chatnotes") {
+            post("/v1/config") {
+                val req = call.receive<HelloRequest>()
+                store.touchDevice(req.deviceId, System.currentTimeMillis())
+                call.respond(AppConfigResponse(config = store.getConfig()))
+            }
+
+            post("/v1/config/save") {
+                val req = call.receive<AppConfigSaveRequest>()
+                val (applied, current) = store.saveConfig(req.config)
+                call.respond(AppConfigResponse(config = current, applied = applied))
+            }
+
             post("/v1/hello") {
                 val req = call.receive<HelloRequest>()
                 store.touchDevice(req.deviceId, System.currentTimeMillis())

@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import com.willam.chatnotes.shared.sync.AppConfigDto
 import com.willam.chatnotes.shared.sync.SyncState
 import java.net.URI
 import java.security.KeyStore
@@ -124,13 +125,15 @@ class ConfigStore(context: Context) {
         val url = base.trim().trimEnd('/'); val name = model.trim()
         if (url.isEmpty() && name.isEmpty() && secret.isEmpty()) {
             // Clearing the embedding config is allowed; hybrid search degrades to keyword.
-            check(prefs.edit().remove("embed_base_url").remove("embed_model").remove("embed_key_encrypted").commit()) { "设置保存失败" }
+            check(prefs.edit().remove("embed_base_url").remove("embed_model").remove("embed_key_encrypted")
+                .putString("cfg_updated_at", System.currentTimeMillis().toString()).commit()) { "设置保存失败" }
             return
         }
         validate(url, name)
         require(secret.length <= 8192 && !secret.contains('\n') && !secret.contains('\r')) { "API Key 格式不正确" }
         check(prefs.edit().putString("embed_base_url", url).putString("embed_model", name)
-            .putString("embed_key_encrypted", encrypted(secret.trim())).commit()) { "设置保存失败" }
+            .putString("embed_key_encrypted", encrypted(secret.trim()))
+            .putString("cfg_updated_at", System.currentTimeMillis().toString()).commit()) { "设置保存失败" }
     }
     fun embedConfigured(): Boolean =
         !(prefs.getString("embed_base_url", "") ?: "").isNullOrBlank() && !(prefs.getString("embed_model", "") ?: "").isNullOrBlank()
@@ -139,7 +142,40 @@ class ConfigStore(context: Context) {
         validate(url, name)
         require(secret.length <= 8192 && !secret.contains('\n') && !secret.contains('\r')) { "API Key 格式不正确" }
         check(prefs.edit().putString("base_url", url).putString("model", name)
-            .putString("api_key_encrypted", encrypted(secret.trim())).remove("api_key").commit()) { "设置保存失败" }
+            .putString("api_key_encrypted", encrypted(secret.trim())).remove("api_key")
+            .putString("cfg_updated_at", System.currentTimeMillis().toString()).commit()) { "设置保存失败" }
+    }
+
+    // ---- 配置备份（服务器 app_config 单行，LWW 同步；见 SyncWorker.reconcileConfig）----
+
+    /** 本地配置版本时间：每次在手机上保存设置时更新；0 = 本机从未编辑过（全新安装/刚重装） */
+    fun configUpdatedAt(): Long = java.lang.Long.parseLong(prefs.getString("cfg_updated_at", "0") ?: "0")
+
+    /** 导出当前配置为备份 DTO。解密失败的 key 记为空串，不阻断导出与同步。 */
+    fun exportConfig(): AppConfigDto = AppConfigDto(
+        llmBaseUrl = prefs.getString("base_url", "") ?: "",
+        llmModel = prefs.getString("model", "") ?: "",
+        llmApiKey = try { apiKey() } catch (e: Exception) { "" },
+        embedBaseUrl = prefs.getString("embed_base_url", "") ?: "",
+        embedModel = prefs.getString("embed_model", "") ?: "",
+        embedApiKey = try { embedApiKey() } catch (e: Exception) { "" },
+        updatedAt = configUpdatedAt(),
+    )
+
+    /**
+     * 应用服务器配置（半段合并）：按字段写入非空值——服务器某字段为空就不动本地对应值，
+     * 防止服务器上的残缺段把手机上正在使用的配置打没。应用后本地版本时间对齐服务器。
+     */
+    @Synchronized fun applyServerConfig(cfg: AppConfigDto) {
+        val e = prefs.edit()
+        if (cfg.llmBaseUrl.isNotBlank()) e.putString("base_url", cfg.llmBaseUrl.trim())
+        if (cfg.llmModel.isNotBlank()) e.putString("model", cfg.llmModel.trim())
+        if (cfg.llmApiKey.isNotBlank()) e.putString("api_key_encrypted", encrypted(cfg.llmApiKey.trim())).remove("api_key")
+        if (cfg.embedBaseUrl.isNotBlank()) e.putString("embed_base_url", cfg.embedBaseUrl.trim().trimEnd('/'))
+        if (cfg.embedModel.isNotBlank()) e.putString("embed_model", cfg.embedModel.trim())
+        if (cfg.embedApiKey.isNotBlank()) e.putString("embed_key_encrypted", encrypted(cfg.embedApiKey.trim())).remove("embed_key")
+        e.putString("cfg_updated_at", cfg.updatedAt.toString())
+        check(e.commit()) { "服务器配置应用失败" }
     }
     companion object {
         fun validate(base: String, model: String) {

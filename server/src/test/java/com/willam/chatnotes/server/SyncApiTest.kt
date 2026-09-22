@@ -1,5 +1,8 @@
 package com.willam.chatnotes.server
 
+import com.willam.chatnotes.shared.sync.AppConfigDto
+import com.willam.chatnotes.shared.sync.AppConfigResponse
+import com.willam.chatnotes.shared.sync.AppConfigSaveRequest
 import com.willam.chatnotes.shared.sync.DeleteMark
 import com.willam.chatnotes.shared.sync.DeleteRequest
 import com.willam.chatnotes.shared.sync.DocKind
@@ -167,5 +170,66 @@ class SyncApiTest {
         val body = resp.bodyAsText()
         assertEquals(1, Regex("\"docId\":\"" + "a".repeat(64) + "\"").findAll(body).count(), "同一文档应只出现一次：$body")
         assertTrue(body.contains("\"content\":\"\""), "最新变更是删除，内容应为空：$body")
+    }
+
+    // ---- 配置备份（/v1/config）----
+
+    @Test
+    fun `config 初始为空 读取返回全空配置`() = withApp { token, client ->
+        val resp = client.postJsonRaw("/v1/config", token, json.encodeToString(HelloRequest.serializer(), HelloRequest("phone-1", "test")))
+        assertEquals(HttpStatusCode.OK, resp.status)
+        val body = resp.bodyAsText()
+        assertTrue(body.contains("\"applied\":true"), body)
+        assertTrue(body.contains("\"updatedAt\":0"), body)
+    }
+
+    @Test
+    fun `config 错误 token 返回 401`() = withApp { _, client ->
+        val resp = client.postJsonRaw("/v1/config", "wrong-token", json.encodeToString(HelloRequest.serializer(), HelloRequest("phone-1", "test")))
+        assertEquals(HttpStatusCode.Unauthorized, resp.status)
+    }
+
+    @Test
+    fun `config 保存后可读回 且字段完整`() = withApp { token, client ->
+        val cfg = AppConfigDto(
+            llmBaseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1", llmModel = "qwen3.8-flash", llmApiKey = "sk-test",
+            embedBaseUrl = "https://dashscope.aliyuncs.com/api/v1", embedModel = "text-embedding-v4", embedApiKey = "sk-emb",
+            updatedAt = 1000L,
+        )
+        val save = client.postJsonRaw("/v1/config/save", token, json.encodeToString(AppConfigSaveRequest.serializer(), AppConfigSaveRequest("phone-1", cfg)))
+        assertEquals(HttpStatusCode.OK, save.status)
+        val saved = json.decodeFromString(AppConfigResponse.serializer(), save.bodyAsText())
+        assertTrue(saved.applied)
+        assertEquals(cfg, saved.config)
+        val read = json.decodeFromString(
+            AppConfigResponse.serializer(),
+            client.postJsonRaw("/v1/config", token, json.encodeToString(HelloRequest.serializer(), HelloRequest("phone-1", "test"))).bodyAsText(),
+        )
+        assertEquals(cfg, read.config)
+    }
+
+    @Test
+    fun `config LWW 旧时间戳被拒并返回服务器版本`() = withApp { token, client ->
+        val newer = AppConfigDto(llmModel = "new-model", llmApiKey = "k2", updatedAt = 2000L)
+        val older = AppConfigDto(llmModel = "old-model", llmApiKey = "k1", updatedAt = 1000L)
+        client.postJsonRaw("/v1/config/save", token, json.encodeToString(AppConfigSaveRequest.serializer(), AppConfigSaveRequest("phone-1", newer)))
+        val resp = json.decodeFromString(
+            AppConfigResponse.serializer(),
+            client.postJsonRaw("/v1/config/save", token, json.encodeToString(AppConfigSaveRequest.serializer(), AppConfigSaveRequest("phone-2", older))).bodyAsText(),
+        )
+        assertEquals(false, resp.applied, "旧时间戳不应被接受")
+        assertEquals(newer, resp.config, "应返回服务器上的较新配置")
+    }
+
+    @Test
+    fun `config 相同时间戳幂等不覆盖`() = withApp { token, client ->
+        val cfg = AppConfigDto(llmModel = "m", llmApiKey = "k", updatedAt = 5000L)
+        client.postJsonRaw("/v1/config/save", token, json.encodeToString(AppConfigSaveRequest.serializer(), AppConfigSaveRequest("phone-1", cfg)))
+        val second = json.decodeFromString(
+            AppConfigResponse.serializer(),
+            client.postJsonRaw("/v1/config/save", token, json.encodeToString(AppConfigSaveRequest.serializer(), AppConfigSaveRequest("phone-1", cfg))).bodyAsText(),
+        )
+        assertEquals(false, second.applied)
+        assertEquals(cfg, second.config)
     }
 }

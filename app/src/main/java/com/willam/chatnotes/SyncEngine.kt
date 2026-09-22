@@ -1,5 +1,8 @@
 package com.willam.chatnotes
 
+import com.willam.chatnotes.shared.sync.AppConfigDto
+import com.willam.chatnotes.shared.sync.AppConfigResponse
+import com.willam.chatnotes.shared.sync.AppConfigSaveRequest
 import com.willam.chatnotes.shared.sync.DeleteMark
 import com.willam.chatnotes.shared.sync.DeleteRequest
 import com.willam.chatnotes.shared.sync.DeleteResponse
@@ -95,5 +98,23 @@ class SyncEngine(
         } catch (e: java.io.IOException) {
             SyncOutcome.Unreachable(e.message ?: "网络错误")
         }
+    }
+
+    /** 读服务器配置备份（/v1/config） */
+    fun fetchConfig(): Pair<SyncOutcome, AppConfigResponse?> = try {
+        val (code, resp) = post("/v1/config", HelloRequest(deviceId, "config"), HelloRequest.serializer(), AppConfigResponse.serializer())
+        if (resp == null) SyncOutcome.Rejected(code, "配置读取被拒绝 (HTTP $code)") to null
+        else SyncOutcome.Ok(0, 0, 0) to resp
+    } catch (e: java.io.IOException) {
+        SyncOutcome.Unreachable(e.message ?: "网络错误") to null
+    }
+
+    /** 保存配置备份（/v1/config/save，服务器 LWW）；返回服务器的当前生效配置 */
+    fun saveConfig(cfg: AppConfigDto): Pair<SyncOutcome, AppConfigResponse?> = try {
+        val (code, resp) = post("/v1/config/save", AppConfigSaveRequest(deviceId, cfg), AppConfigSaveRequest.serializer(), AppConfigResponse.serializer())
+        if (resp == null) SyncOutcome.Rejected(code, "配置保存被拒绝 (HTTP $code)") to null
+        else SyncOutcome.Ok(0, 0, 0) to resp
+    } catch (e: java.io.IOException) {
+        SyncOutcome.Unreachable(e.message ?: "网络错误") to null
     }
 }
