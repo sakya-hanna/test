@@ -170,7 +170,7 @@ class SyncStore(dbUrl: String) : AutoCloseable {
         }
         conn.prepareStatement(sql).use { ps ->
             var i = 1
-            if (hasQ) { ps.setString(i, "%$query%"); i++; ps.setString(i, "%$query%") }
+            if (hasQ) { ps.setString(i, "%$query%"); ps.setString(i + 1, "%$query%"); i += 2 }
             ps.setInt(i, limit)
             ps.executeQuery().use { rs ->
                 while (rs.next()) rows.add(rsToRow(rs))
