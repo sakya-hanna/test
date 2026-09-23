@@ -11,6 +11,7 @@ import com.willam.chatnotes.shared.sync.DocKind
 import com.willam.chatnotes.shared.sync.SyncDoc
 import com.willam.chatnotes.shared.sync.SyncLogic
 import com.willam.chatnotes.shared.sync.SyncState
+import com.willam.chatnotes.shared.sync.sha256Hex16
 import kotlinx.serialization.json.Json
 import java.io.File
 
@@ -69,7 +70,9 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             SyncDoc(
                 kind = DocKind.note, docId = d.docId, category = d.category,
                 title = d.title, content = d.content, updatedAt = System.currentTimeMillis(),
-                deviceId = engine.deviceId, contentHash = d.hash,
+                deviceId = engine.deviceId,
+                // 线上校验仍是纯内容 hash（服务器 bad_hash）；memo 指纹只用于本地脏检查
+                contentHash = sha256Hex16(d.content),
             )
         }
         val pushOutcome = engine.push(docs)
@@ -171,6 +174,8 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         for (d in writes) {
             val cats = if (d.category.isBlank()) emptyList() else d.category.split('/', '\\').filter { it.isNotBlank() }
             try {
+                // 远端改名/移动：同 ID 旧文件（旧标题/旧目录）先移除，否则 write 的拒覆盖语义会留下两份
+                graph.notes.allFiles().firstOrNull { noteId(it) == d.docId }?.delete()
                 files.write(cats, d.title, d.docId, d.content)
             } catch (e: Exception) {
                 android.util.Log.w("ChatNotes", "sync: write failed ${d.docId}: ${e.message}")

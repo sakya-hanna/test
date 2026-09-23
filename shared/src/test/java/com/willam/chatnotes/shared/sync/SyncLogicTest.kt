@@ -11,15 +11,36 @@ class SyncLogicTest {
 
     @Test
     fun `planPush 新增与变更都进批次`() {
-        val synced = mapOf("a" to sha256Hex16("内容-a"), "b" to "旧hash")
+        val synced = mapOf("a" to SyncLogic.memoHash("编程", "标题a", "内容-a"), "b" to "旧hash")
         val push = SyncLogic.planPush(listOf(local("a"), local("b"), local("c")), synced)
         assertEquals(setOf("b", "c"), push.map { it.docId }.toSet())
     }
 
     @Test
     fun `planPush 无变化时空批次`() {
-        val synced = mapOf("a" to sha256Hex16("内容-a"))
+        val synced = mapOf("a" to SyncLogic.memoHash("编程", "标题a", "内容-a"))
         assertTrue(SyncLogic.planPush(listOf(local("a")), synced).isEmpty())
+    }
+
+    @Test
+    fun `planPush 改名或移动分类视为变更进批次`() {
+        // 旧指纹按「分类+标题+内容」记录：只改标题或只改分类都要被检出
+        val moved = local("a").copy(title = "新标题")
+        val recategorized = local("a").copy(category = "生活")
+        val synced = mapOf("a" to SyncLogic.memoHash("编程", "标题a", "内容-a"))
+        val push = SyncLogic.planPush(listOf(moved, recategorized), synced)
+        assertEquals(setOf("a"), push.map { it.docId }.toSet())
+    }
+
+    @Test
+    fun `applyPull 远端改名同样判定为写入`() {
+        // 本地指纹是旧标题的全量指纹 → 远端新标题应产生写入
+        val docs = listOf(
+            SyncDoc(DocKind.note, "a", category = "编程", title = "远端新标题", content = "内容-a", updatedAt = 1, deviceId = "pad", contentHash = sha256Hex16("内容-a")),
+        )
+        val localHashes = mapOf("a" to SyncLogic.memoHash("编程", "标题a", "内容-a"))
+        val (writes, _) = SyncLogic.applyPull(docs, localHashes)
+        assertEquals(listOf("a"), writes.map { it.docId })
     }
 
     @Test
@@ -35,7 +56,7 @@ class SyncLogicTest {
             SyncDoc(DocKind.note, "w2", category = "", title = "t", content = "相同内容", updatedAt = 1, deviceId = "pad", contentHash = sha256Hex16("相同内容")),
             SyncDoc(DocKind.note, "d1", category = "", title = "", content = "", updatedAt = 2, deviceId = "pad", contentHash = "x"),
         )
-        val localHashes = mapOf("w2" to sha256Hex16("相同内容"), "d1" to "本地还有")
+        val localHashes = mapOf("w2" to SyncLogic.memoHash("", "t", "相同内容"), "d1" to "本地还有")
         val (writes, deletes) = SyncLogic.applyPull(docs, localHashes)
         assertEquals(listOf("w1"), writes.map { it.docId })
         assertEquals(listOf("d1"), deletes.map { it.docId })

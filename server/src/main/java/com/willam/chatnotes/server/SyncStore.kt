@@ -75,7 +75,8 @@ class SyncStore(dbUrl: String) : AutoCloseable {
     ): String {
         val existing = queryDoc(kind, docId)
         if (existing != null) {
-            if (existing.contentHash == contentHash) return "same"
+            // 完全相同才算幂等命中；同内容但标题/分类不同 = 改名/移动，是合法更新（P1 起支持）
+            if (existing.contentHash == contentHash && existing.title == title && existing.category == category) return "same"
             if (existing.updatedAt >= updatedAt) return "older"
         }
         // 方言分支：SQLite 用 INSERT OR REPLACE；PG 用 ON CONFLICT DO UPDATE
@@ -287,13 +288,14 @@ class SyncStore(dbUrl: String) : AutoCloseable {
 
     private fun queryDoc(kind: String, docId: String): DocRow? {
         conn.prepareStatement(
-            "SELECT content_hash, updated_at, deleted_at FROM docs WHERE kind=? AND doc_id=?"
+            "SELECT content_hash, updated_at, deleted_at, title, category FROM docs WHERE kind=? AND doc_id=?"
         ).use { ps ->
             ps.setString(1, kind); ps.setString(2, docId)
             ps.executeQuery().use { rs ->
                 if (!rs.next()) return null
                 return DocRow(
-                    seq = 0, kind = kind, docId = docId, category = "", title = "", content = "",
+                    seq = 0, kind = kind, docId = docId, category = rs.getString(5) ?: "",
+                    title = rs.getString(4) ?: "", content = "",
                     updatedAt = rs.getLong(2), deviceId = "", contentHash = rs.getString(1),
                     deletedAt = rs.getLong(3),
                 )

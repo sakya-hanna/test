@@ -110,9 +110,23 @@ class SyncApiTest {
     fun `push 幂等：同内容重复推送不产生新变更`() = withApp { token, client ->
         val d = doc("a".repeat(64), "内容")
         val first = client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
-        assertTrue(first.bodyAsText().contains("\"status\":\"new\""))
+        assertTrue(first.bodyAsText().contains("\"status\":\"new\""), "first: " + first.bodyAsText())
         val second = client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
-        assertTrue(second.bodyAsText().contains("\"status\":\"same\""))
+        assertTrue(second.bodyAsText().contains("\"status\":\"same\""), "second: " + second.bodyAsText())
+    }
+
+    @Test
+    fun `push 同内容改名或移动是合法更新不被判 same`() = withApp { token, client ->
+        val d = doc("a".repeat(64), "内容")
+        client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
+        val renamed = client.postJsonRaw(
+            "/v1/push", token,
+            json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d.copy(title = "改名后", category = "新分类/子目录", updatedAt = 2000L)))),
+        )
+        assertTrue(renamed.bodyAsText().contains("\"status\":\"new\""), renamed.bodyAsText())
+        val pull = client.postJsonRaw("/v1/pull", token, json.encodeToString(PullRequest.serializer(), PullRequest(deviceId = "phone-2", cursor = 0)))
+        assertTrue(pull.bodyAsText().contains("改名后"), pull.bodyAsText())
+        assertTrue(pull.bodyAsText().contains("新分类/子目录"), pull.bodyAsText())
     }
 
     @Test
