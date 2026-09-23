@@ -11,6 +11,8 @@ WorkingDirectory=/opt/chatnotes
 # 内存预算（设计 §12.3）：512m 堆封顶，4GB VPS 上与既有服务共存
 Environment=CHATNOTES_PORT=8443
 Environment=CHATNOTES_DB=/opt/chatnotes/data/chatnotes-server.db
+# /admin 只读管理页默认关闭（无鉴权）；鉴权补齐前不要开：Environment=CHATNOTES_ADMIN=1
+#Environment=CHATNOTES_ADMIN=1
 Environment=JAVA_TOOL_OPTIONS=-Xmx512m -XX:+UseSerialGC -XX:MaxMetaspaceSize=128m
 ExecStart=/usr/bin/java -jar /opt/chatnotes/chatnotes-server.jar
 Restart=on-failure

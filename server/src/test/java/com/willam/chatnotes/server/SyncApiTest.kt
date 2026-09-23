@@ -43,14 +43,17 @@ private fun doc(
     contentHash = sha256Hex16(content),
 )
 
-private fun withApp(block: suspend ApplicationTestBuilder.(String, HttpClient) -> Unit) {
+private fun withApp(
+    adminEnabled: Boolean = false,
+    block: suspend ApplicationTestBuilder.(String, HttpClient) -> Unit,
+) {
     val db = Files.createTempFile("chatnotes-test", ".db").toFile().apply { deleteOnExit() }
     testApplication {
         environment {
             config = ApplicationConfig("empty")
         }
         application {
-            syncModule(SyncStore("jdbc:sqlite:" + db.absolutePath), TOKEN)
+            syncModule(SyncStore("jdbc:sqlite:" + db.absolutePath), TOKEN, adminEnabled)
         }
         val client = createClient { }
         block(TOKEN, client)
@@ -231,5 +234,27 @@ class SyncApiTest {
         )
         assertEquals(false, second.applied)
         assertEquals(cfg, second.config)
+    }
+
+    // ---- /admin 只读管理页开关（默认关闭防公网暴露）----
+
+    @Test
+    fun `admin 默认关闭 访问返回 404`() = withApp { _, client ->
+        val resp = client.get("/admin")
+        assertEquals(HttpStatusCode.NotFound, resp.status)
+        val doc = client.get("/admin/doc?kind=note&id=${"a".repeat(64)}")
+        assertEquals(HttpStatusCode.NotFound, doc.status)
+    }
+
+    @Test
+    fun `admin 显式开启后列表和详情可访问`() = withApp(adminEnabled = true) { token, client ->
+        val d = doc("a".repeat(64), "# 管理页内容")
+        client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
+        val list = client.get("/admin")
+        assertEquals(HttpStatusCode.OK, list.status)
+        assertTrue(list.bodyAsText().contains("笔记 " + "a".repeat(64).take(12)))
+        val detail = client.get("/admin/doc?kind=note&id=${"a".repeat(64)}")
+        assertEquals(HttpStatusCode.OK, detail.status)
+        assertTrue(detail.bodyAsText().contains("管理页内容"))
     }
 }

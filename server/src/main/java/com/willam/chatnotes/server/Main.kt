@@ -51,7 +51,7 @@ fun urlEsc(s: String): String = java.net.URLEncoder.encode(s, "UTF-8")
 /** 鉴权通过后的 principal 占位；token 本身校验见 bearer validate */
 object TokenPrincipal : Principal
 
-fun Application.syncModule(store: SyncStore, token: String) {
+fun Application.syncModule(store: SyncStore, token: String, adminEnabled: Boolean = false) {
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; encodeDefaults = true })
     }
@@ -72,7 +72,10 @@ fun Application.syncModule(store: SyncStore, token: String) {
         }
 
         // 极简管理页（只读）：文档列表 + 按标题/内容搜索。P1 最小实现，无 JS 无外部资源。
-        get("/admin") {
+        // 默认关闭（不注册路由→404）：/admin 无鉴权，公网部署前必须保持关闭；
+        // 补齐鉴权后可用 CHATNOTES_ADMIN=1 开启。
+        if (adminEnabled) {
+            get("/admin") {
             val q = call.request.queryParameters["q"].orEmpty().trim()
             val docs = store.listDocs(q, limit = 200)
             val rows = docs.joinToString("") { d ->
@@ -110,6 +113,7 @@ input{padding:6px;width:60%}button{padding:6px 14px}.m{color:#888;font-size:12px
 </body></html>"""
                 call.respondText(html, io.ktor.http.ContentType.Text.Html)
             }
+        }
         }
 
         authenticate("chatnotes") {
@@ -206,10 +210,12 @@ fun main() {
         ?: error("CHATNOTES_TOKEN env or token.txt required")
     val ksPath = System.getenv("CHATNOTES_KEYSTORE")
     val ksPass = System.getenv("CHATNOTES_KEYSTORE_PASSWORD") ?: "chatnotes"
+    // /admin 只读管理页默认关闭（无鉴权，公网暴露风险）；显式 CHATNOTES_ADMIN=1 才开放
+    val adminEnabled = System.getenv("CHATNOTES_ADMIN") == "1"
 
     val server = embeddedServer(Netty, environment = applicationEngineEnvironment {
         log = org.slf4j.LoggerFactory.getLogger("chatnotes")
-        module { syncModule(SyncStore(dbUrl), token) }
+        module { syncModule(SyncStore(dbUrl), token, adminEnabled) }
         if (ksPath != null) {
             // 生产：PKCS12 证书（gen-certs.sh 产出），Ktor 直接终止 TLS
             val ks = java.security.KeyStore.getInstance("PKCS12").apply {
