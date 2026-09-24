@@ -17,7 +17,8 @@ data class SearchHit(
     val score: Int,
     val conversationId: String,
     val conversationTitle: String,
-    val moreHits: Int = 0      // additional hit windows hidden behind "展开 N 处"
+    val moreHits: Int = 0,     // additional hit windows hidden behind "展开 N 处"
+    val docId: String = ""     // stable (kind,id) key shared by keyword and vector rankings
 )
 
 /**
@@ -155,13 +156,13 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
             vectorSearch(vec, api.modelId)
         }.getOrDefault(emptyList())
         if (semantic.isEmpty()) return keyword
-        val keyRank = keyword.map { "${it.kind}:${it.file.absolutePath}:${it.conversationId}" }
+        val keyRank = keyword.map { "${it.kind}:${it.docId}" }
         val semRank = semantic.map { "${it.first}:${it.second}" }
         val fused = Rrf.fuse(listOf(keyRank, semRank)).take(limit * 2).toMap()
         // Materialize fused order: keyword hits carry full data; semantic-only
         // hits are filled from documents.
         val byKey = HashMap<String, SearchHit>()
-        keyword.forEach { byKey["${it.kind}:${it.file.absolutePath}:${it.conversationId}"] = it }
+        keyword.forEach { byKey["${it.kind}:${it.docId}"] = it }
         val result = mutableListOf<SearchHit>()
         for ((key, _) in fused) {
             val hit = byKey[key] ?: semanticHit(key, rawQuery) ?: continue
@@ -171,9 +172,7 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
         // Keyword-only results that fell out of the fusion list still surface.
         for (h in keyword) {
             if (result.size >= limit) break
-            val k = "${h.kind}:${h.file.absolutePath}:${h.conversationId}"
-            if (fused.containsKey(k) && byKey.values.none { it === h }) continue
-            if (result.none { it.kind == h.kind && it.file == h.file && it.conversationId == h.conversationId }) result.add(h)
+            if (result.none { it.kind == h.kind && it.docId == h.docId }) result.add(h)
         }
         return result
     }
@@ -212,7 +211,7 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
             val w = SearchLogic.snippets(body, rawQuery).firstOrNull()
             SearchHit(kind, File(c.getString(3) ?: ""), c.getString(0), c.getString(1), c.getLong(5),
                 w?.first ?: c.getString(0), w?.second ?: 0, w?.third ?: 0, 0,
-                if (kind == "conv") id else (c.getString(4) ?: ""), "", 0)
+                if (kind == "conv") id else (c.getString(4) ?: ""), "", 0, id)
         }
     }
 
@@ -265,6 +264,7 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
 
     @Synchronized private fun upsert(doc: Doc) {
         if (ftsMode) db.execSQL("DELETE FROM doc_fts WHERE kind=? AND id=?", arrayOf(doc.kind, doc.id))
+        db.execSQL("DELETE FROM chunks WHERE kind=? AND doc_id=?", arrayOf(doc.kind, doc.id))
         db.execSQL("INSERT OR REPLACE INTO documents(kind,id,title,category,body,payload,src,updated,size) VALUES(?,?,?,?,?,?,?,?,?)",
             arrayOf(doc.kind, doc.id, doc.title.take(300), doc.category.take(300),
                 doc.body.take(500000), doc.payload, doc.src, doc.updatedAt, doc.body.length))
@@ -276,6 +276,7 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
     @Synchronized private fun remove(kind: String, id: String) {
         if (ftsMode) db.execSQL("DELETE FROM doc_fts WHERE kind=? AND id=?", arrayOf(kind, id))
         db.execSQL("DELETE FROM documents WHERE kind=? AND id=?", arrayOf(kind, id))
+        db.execSQL("DELETE FROM chunks WHERE kind=? AND doc_id=?", arrayOf(kind, id))
     }
 
     /** Mark stale so the next ensureIndexed() refreshes before searching. */
@@ -361,6 +362,7 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
         try {
             if (ftsMode) db.execSQL("DELETE FROM doc_fts")
             db.execSQL("DELETE FROM documents")
+            db.execSQL("DELETE FROM chunks")
             dirty = true
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
@@ -418,7 +420,7 @@ class SearchIndex(private val context: Context, name: String = "search.db") {
             first?.first ?: title, first?.second ?: 0, first?.third ?: 0,
             score, if (kind == "conv") r[1] as String else r[6] as String,
             if (kind == "conv") title else "",
-            (windows.size - 1).coerceAtLeast(0))
+            (windows.size - 1).coerceAtLeast(0), r[1] as String)
     }
 
     private fun Double.absoluteValueSafe(): Double = if (this < 0) -this else this

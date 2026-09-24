@@ -20,6 +20,28 @@ data class SyncState(
  */
 object SyncLogic {
 
+    enum class PullAction { NONE, WRITE_REMOTE, DELETE_LOCAL, KEEP_LOCAL, COPY_REMOTE, COPY_LOCAL_THEN_DELETE }
+
+    /** Decide from the last acknowledged version, not merely the two current versions.
+     * A pending local deletion must not be undone by an older server change.
+     * Divergent edits are retained as separate notes before either side is replaced.
+     */
+    fun pullAction(localHash: String?, acknowledgedHash: String?, remoteHash: String?,
+                   pendingDelete: Boolean, pendingRestore: Boolean = false): PullAction {
+        if (pendingRestore && localHash != null) return PullAction.KEEP_LOCAL
+        if (remoteHash == null) {
+            if (pendingDelete || localHash == null) return PullAction.NONE
+            return if (localHash != acknowledgedHash) PullAction.COPY_LOCAL_THEN_DELETE else PullAction.DELETE_LOCAL
+        }
+        if (pendingDelete) return if (remoteHash == acknowledgedHash) PullAction.KEEP_LOCAL else PullAction.COPY_REMOTE
+        if (localHash == remoteHash) return PullAction.NONE
+        if (localHash == null) return PullAction.WRITE_REMOTE
+        if (localHash != acknowledgedHash) {
+            return if (remoteHash == acknowledgedHash) PullAction.KEEP_LOCAL else PullAction.COPY_REMOTE
+        }
+        return PullAction.WRITE_REMOTE
+    }
+
     /** 本地文档的精简描述（由 app 层从文件系统提取） */
     data class LocalDoc(
         val docId: String,

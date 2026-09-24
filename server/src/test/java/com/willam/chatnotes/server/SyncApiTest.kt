@@ -5,6 +5,7 @@ import com.willam.chatnotes.shared.sync.AppConfigResponse
 import com.willam.chatnotes.shared.sync.AppConfigSaveRequest
 import com.willam.chatnotes.shared.sync.DeleteMark
 import com.willam.chatnotes.shared.sync.DeleteRequest
+import com.willam.chatnotes.shared.sync.DeleteResponse
 import com.willam.chatnotes.shared.sync.DocKind
 import com.willam.chatnotes.shared.sync.HelloRequest
 import com.willam.chatnotes.shared.sync.PullRequest
@@ -12,6 +13,7 @@ import com.willam.chatnotes.shared.sync.PushRequest
 import com.willam.chatnotes.shared.sync.SyncDoc
 import io.ktor.client.HttpClient
 import io.ktor.client.request.bearerAuth
+import io.ktor.client.request.basicAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
@@ -89,7 +91,7 @@ class SyncApiTest {
         val body = json.encodeToString(HelloRequest.serializer(), HelloRequest(deviceId = "phone-1", appVersion = "test"))
         val resp = client.postJsonRaw("/v1/hello", token, body)
         assertEquals(HttpStatusCode.OK, resp.status)
-        assertTrue(resp.bodyAsText().contains("\"protocolVersion\":1"))
+        assertTrue(resp.bodyAsText().contains("\"protocolVersion\":2"))
     }
 
     @Test
@@ -156,6 +158,34 @@ class SyncApiTest {
         val after = client.postJsonRaw("/v1/pull", token, json.encodeToString(PullRequest.serializer(), PullRequest(deviceId = "phone-1", cursor = 0)))
         assertTrue(after.bodyAsText().contains("a".repeat(64)))       // 变更日志保留墓碑
         assertTrue(!after.bodyAsText().contains("内容"))         // 内容已软删不可得
+    }
+
+    @Test
+    fun `trash restore with newer timestamp resurrects the same document`() = withApp { token, client ->
+        val id = "a".repeat(64)
+        val first = doc(id, "内容", updatedAt = 1000L)
+        client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest("phone-1", listOf(first))))
+        client.postJsonRaw("/v1/delete", token, json.encodeToString(DeleteRequest.serializer(),
+            DeleteRequest("phone-1", listOf(DeleteMark(DocKind.note, id, 2000L, "phone-1")))))
+        val restored = first.copy(updatedAt = 3000L)
+        val push = client.postJsonRaw("/v1/push", token,
+            json.encodeToString(PushRequest.serializer(), PushRequest("phone-1", listOf(restored))))
+        assertTrue(push.bodyAsText().contains("\"status\":\"new\""), push.bodyAsText())
+        val pull = client.postJsonRaw("/v1/pull", token,
+            json.encodeToString(PullRequest.serializer(), PullRequest("phone-2", 0)))
+        assertTrue(pull.bodyAsText().contains("内容"), pull.bodyAsText())
+    }
+
+    @Test
+    fun `delete does not acknowledge a newer server revision`() = withApp { token, client ->
+        val id = "b".repeat(64)
+        client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(),
+            PushRequest("phone-1", listOf(doc(id, "newer", updatedAt = 5000L)))))
+        val response = client.postJsonRaw("/v1/delete", token,
+            json.encodeToString(DeleteRequest.serializer(),
+                DeleteRequest("phone-2", listOf(DeleteMark(DocKind.note, id, 4000L, "phone-2")))))
+        val result = json.decodeFromString(DeleteResponse.serializer(), response.bodyAsText())
+        assertEquals(listOf(id), result.rejectedIds)
     }
 
     @Test
@@ -261,13 +291,16 @@ class SyncApiTest {
     }
 
     @Test
-    fun `admin 显式开启后列表和详情可访问`() = withApp(adminEnabled = true) { token, client ->
+    fun `admin 显式开启后仍须鉴权才可读取列表和详情`() = withApp(adminEnabled = true) { token, client ->
         val d = doc("a".repeat(64), "# 管理页内容")
         client.postJsonRaw("/v1/push", token, json.encodeToString(PushRequest.serializer(), PushRequest(deviceId = "phone-1", docs = listOf(d))))
-        val list = client.get("/admin")
+        assertEquals(HttpStatusCode.Unauthorized, client.get("/admin").status)
+        assertEquals(HttpStatusCode.Unauthorized, client.get("/admin/doc?kind=note&id=${"a".repeat(64)}").status)
+        assertEquals(HttpStatusCode.Unauthorized, client.get("/admin") { basicAuth("admin", "wrong") }.status)
+        val list = client.get("/admin") { basicAuth("admin", token) }
         assertEquals(HttpStatusCode.OK, list.status)
         assertTrue(list.bodyAsText().contains("笔记 " + "a".repeat(64).take(12)))
-        val detail = client.get("/admin/doc?kind=note&id=${"a".repeat(64)}")
+        val detail = client.get("/admin/doc?kind=note&id=${"a".repeat(64)}") { basicAuth("admin", token) }
         assertEquals(HttpStatusCode.OK, detail.status)
         assertTrue(detail.bodyAsText().contains("管理页内容"))
     }

@@ -648,7 +648,7 @@ class MainActivity : AppCompatActivity() {
                                 val dest = admin.restore(meta)
                                 graph.search.ensureIndexed(graph.notes, graph.db)
                                 dest
-                            }, { toast("已恢复"); render() })
+                            }, { toast("已恢复"); SyncWorker.enqueueAfterNoteChange(applicationContext); render() })
                         }
                         .setNeutralButton("彻底删除") { _, _ ->
                             disk({

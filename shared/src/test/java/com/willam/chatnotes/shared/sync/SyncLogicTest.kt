@@ -6,6 +6,41 @@ import kotlin.test.assertTrue
 
 class SyncLogicTest {
 
+    @Test
+    fun `own push echo cannot recreate a pending local deletion`() {
+        val old = "acknowledged"
+        assertEquals(SyncLogic.PullAction.KEEP_LOCAL,
+            SyncLogic.pullAction(null, old, old, pendingDelete = true))
+    }
+
+    @Test
+    fun `concurrent edits retain remote copy before local push`() {
+        assertEquals(SyncLogic.PullAction.COPY_REMOTE,
+            SyncLogic.pullAction("local-edit", "common-base", "remote-edit", pendingDelete = false))
+        assertEquals(SyncLogic.PullAction.KEEP_LOCAL,
+            SyncLogic.pullAction("local-edit", "common-base", "common-base", pendingDelete = false))
+    }
+
+    @Test
+    fun `remote tombstone preserves a locally edited version`() {
+        assertEquals(SyncLogic.PullAction.COPY_LOCAL_THEN_DELETE,
+            SyncLogic.pullAction("local-edit", "common-base", null, pendingDelete = false))
+    }
+
+    @Test
+    fun `explicit trash restore survives an old remote tombstone`() {
+        assertEquals(SyncLogic.PullAction.KEEP_LOCAL,
+            SyncLogic.pullAction("restored", null, null, pendingDelete = false, pendingRestore = true))
+    }
+
+    @Test
+    fun `unchanged local note accepts remote rename or deletion`() {
+        assertEquals(SyncLogic.PullAction.WRITE_REMOTE,
+            SyncLogic.pullAction("common-base", "common-base", "remote-edit", pendingDelete = false))
+        assertEquals(SyncLogic.PullAction.DELETE_LOCAL,
+            SyncLogic.pullAction("common-base", "common-base", null, pendingDelete = false))
+    }
+
     private fun local(id: String, content: String = "内容-$id") =
         SyncLogic.LocalDoc(docId = id, category = "编程", title = "标题$id", content = content)
 

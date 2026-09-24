@@ -4,7 +4,7 @@ plugins {
     id("com.github.johnrengelman.shadow")
 }
 
-version = "0.1.0"
+version = "0.2.0"
 
 tasks.shadowJar {
     manifest {
@@ -18,7 +18,7 @@ tasks.shadowJar {
 }
 
 kotlin {
-    jvmToolchain(21)
+    jvmToolchain(17)
 }
 
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {

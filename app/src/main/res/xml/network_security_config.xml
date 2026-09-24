@@ -1,21 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  后台同步自建 CA 信任配置（设计 §12.4）：
-  - 自建 CA（chatnotes_ca.pem）仅用于用户添加的 https:// 地址；
-  - 其余流量维持系统默认（系统 CA），cleartext 由 manifest 全局禁止。
--->
+<!-- WebView and model APIs use only the system roots. The private sync CA is
+     loaded for the sync connection alone in SyncTls.kt. -->
 <network-security-config>
     <base-config>
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">10.0.0.1</domain>
-        <trust-anchors>
-            <certificates src="@raw/chatnotes_ca" />
-            <certificates src="system" />
-        </trust-anchors>
-    </domain-config>
 </network-security-config>

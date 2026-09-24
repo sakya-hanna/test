@@ -2,7 +2,10 @@ package com.willam.chatnotes
 
 import android.content.Context
 import androidx.work.CoroutineWorker
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
@@ -10,10 +13,9 @@ import com.willam.chatnotes.shared.sync.DeleteMark
 import com.willam.chatnotes.shared.sync.DocKind
 import com.willam.chatnotes.shared.sync.SyncDoc
 import com.willam.chatnotes.shared.sync.SyncLogic
-import com.willam.chatnotes.shared.sync.SyncState
 import com.willam.chatnotes.shared.sync.sha256Hex16
-import kotlinx.serialization.json.Json
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 /** 同步配置（SharedPreferences；token 走 ConfigStore 加密存储） */
 data class SyncConfig(val baseUrl: String, val token: String)
@@ -21,51 +23,93 @@ data class SyncConfig(val baseUrl: String, val token: String)
 /**
  * 同步任务（形态 A）：
  * 打开 app 或笔记变更后由 MainActivity/SummaryWorker 触发。
- * 流程 = push 本地新增/变更 → pull 服务器增量 → 应用写入与墓碑 → 保存光标。
- * 全程幂等，失败不打扰用户；服务器不可达时静默保留本地（下次触发重试）。
+ * Compare every pulled version with the last acknowledged version. Preserve
+ * concurrent edits as separate conflict notes before changing an existing note.
  */
 class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
         val graph = AppGraph.get(applicationContext)
         val config = graph.config.syncConfig() ?: return Result.success() // 未配置同步：直接完成
-        val engine = SyncEngine(config.baseUrl, config.token, deviceId(applicationContext))
+        val engine = SyncEngine(applicationContext, config.baseUrl, config.token, deviceId(applicationContext))
         fun log(m: String) = android.util.Log.d("ChatNotes", "sync: $m")
+        when (val handshake = engine.hello("0.2.1")) {
+            is SyncOutcome.Ok -> Unit
+            is SyncOutcome.Unreachable -> { log("handshake unreachable: ${handshake.cause}"); return Result.retry() }
+            is SyncOutcome.Rejected -> { log("handshake rejected: ${handshake.detail}"); return Result.failure() }
+        }
 
         // 0) 配置对账：LLM/embed 设置在服务器存一份（LWW），换机/重装自动恢复
         reconcileConfig(engine, ::log)
 
-        // 1) 全量对账：pull 服务器增量（其他设备写入 + 删除墓碑）
-        var cursor = graph.config.syncCursor()
+        // Capture pending deletions before pulling. A delayed echo of our own
+        // push must never recreate a note the user just moved to the trash.
+        var state = graph.config.syncState()
+        var cursor = state.cursor
+        val pendingDeletes = SyncLogic.planDeletes(localDocs(graph).map { it.docId }.toSet(), state.hashes.keys).toSet()
+        val prefs = applicationContext.getSharedPreferences("config", Context.MODE_PRIVATE)
+        val pendingRestores = prefs.getStringSet("pending_restores", emptySet()).orEmpty().toSet()
         var nPulled = 0
         var nDeleted = 0
-        val writeFailures = mutableListOf<String>()
         while (true) {
             val (outcome, resp) = engine.pull(cursor)
             when (outcome) {
-                is SyncOutcome.Unreachable -> { log("unreachable: ${outcome.cause}"); return Result.success() } // 静默：下次再同步
+                is SyncOutcome.Unreachable -> { log("unreachable: ${outcome.cause}"); return Result.retry() }
                 is SyncOutcome.Rejected -> { log("rejected: ${outcome.detail}"); return Result.failure() }      // 配置问题：不重试
                 is SyncOutcome.Ok -> {}
             }
             val body = resp!!
-            val localHashes = localHashes(graph)
-            val (w, d) = SyncLogic.applyPull(body.docs, localHashes)
             nPulled += body.docs.size
-            // 先应用写入；有任何失败则光标停在变更前，下次重拉（拉取与写入均幂等）
-            val failures = applyWrites(graph, w)
-            writeFailures += failures
-            for (t in d) if (deleteLocalNote(graph, t.docId)) nDeleted++
-            cursor = if (failures.isEmpty()) body.cursor else cursor
-            log("pull batch: docs=${body.docs.size} writes=${w.size} fails=${failures.size} cursor=$cursor")
+            val hashes = state.hashes.toMutableMap()
+            val localById = localDocs(graph).associateBy { it.docId }.toMutableMap()
+            try {
+                for (d in body.docs) {
+                    if (d.kind != DocKind.note) continue
+                    val local = localById[d.docId]
+                    val remoteHash = if (d.content.isEmpty() && d.title.isEmpty()) null
+                        else SyncLogic.memoHash(d.category, d.title, d.content)
+                    val action = SyncLogic.pullAction(local?.hash, hashes[d.docId], remoteHash,
+                        d.docId in pendingDeletes, d.docId in pendingRestores)
+                    when (action) {
+                        SyncLogic.PullAction.WRITE_REMOTE -> {
+                            applyRemote(graph, d); hashes[d.docId] = remoteHash!!
+                            localById[d.docId] = SyncLogic.LocalDoc(d.docId, d.category, d.title, d.content)
+                        }
+                        SyncLogic.PullAction.DELETE_LOCAL -> {
+                            if (deleteLocalNote(graph, d.docId)) nDeleted++
+                            hashes.remove(d.docId); localById.remove(d.docId)
+                        }
+                        SyncLogic.PullAction.COPY_LOCAL_THEN_DELETE -> {
+                            copyConflict(graph, requireNotNull(local))
+                            if (deleteLocalNote(graph, d.docId)) nDeleted++
+                            hashes.remove(d.docId); localById.remove(d.docId)
+                        }
+                        SyncLogic.PullAction.COPY_REMOTE -> {
+                            copyConflict(graph, SyncLogic.LocalDoc(d.docId, d.category, d.title, d.content))
+                        }
+                        SyncLogic.PullAction.NONE -> if (remoteHash == null) hashes.remove(d.docId)
+                            else if (d.docId !in pendingDeletes) hashes[d.docId] = remoteHash
+                        SyncLogic.PullAction.KEEP_LOCAL -> Unit
+                    }
+                }
+            } catch (e: Exception) {
+                log("pull write failed, cursor retained: ${e.message}")
+                return Result.failure() // Never spin on a failed page with hasMore=true.
+            }
+            if (body.hasMore && body.cursor <= cursor) {
+                log("server returned a non-progressing pull cursor"); return Result.failure()
+            }
+            cursor = body.cursor
+            state = state.copy(cursor = cursor, hashes = hashes)
+            graph.config.saveSyncState(state) // Commit a fully applied page before requesting the next.
+            log("pull batch: docs=${body.docs.size} cursor=$cursor")
             if (!body.hasMore) break
         }
-        if (writeFailures.isNotEmpty()) log("WARN write failures: $writeFailures")
         log("pull done: nPulled=$nPulled nDeleted=$nDeleted cursor=$cursor")
 
         // 2) push：本地新增/有变化的笔记
-        val synced = graph.config.syncState()
         val locals = localDocs(graph)
-        val toPush = SyncLogic.planPush(locals, synced.hashes)
+        val toPush = SyncLogic.planPush(locals, state.hashes)
         val docs = toPush.map { d ->
             SyncDoc(
                 kind = DocKind.note, docId = d.docId, category = d.category,
@@ -77,24 +121,30 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         }
         val pushOutcome = engine.push(docs)
         log("push: n=${docs.size} -> $pushOutcome")
-
-        // 3) 广播本地删除（pull 阶段没覆盖的：本地刚删、服务器还不知道）
-        val delIds = SyncLogic.planDeletes(locals.map { it.docId }.toSet(), synced.hashes.keys)
-        val delOutcome = engine.delete(delIds.map { DeleteMark(DocKind.note, it, System.currentTimeMillis(), engine.deviceId) })
-
-        // 4) 合并状态：push/delete 都被服务器确认后，才把这些 ID 记为已同步
-        var state = synced.copy(cursor = cursor)
-        if (pushOutcome is SyncOutcome.Ok) {
-            state = state.copy(hashes = state.hashes + toPush.associate { d -> d.docId to d.hash })
-        }
-        if (delOutcome is SyncOutcome.Ok) {
-            state = state.copy(hashes = state.hashes - delIds.toSet())
+        when (pushOutcome) {
+            is SyncOutcome.Ok -> state = SyncLogic.mergePushResult(state, toPush, pushOutcome.results)
+            is SyncOutcome.Unreachable -> return Result.retry()
+            is SyncOutcome.Rejected -> return Result.failure()
         }
         graph.config.saveSyncState(state)
-        if (pushOutcome is SyncOutcome.Ok && delOutcome is SyncOutcome.Ok && writeFailures.isEmpty()) {
-            applicationContext.getSharedPreferences("config", Context.MODE_PRIVATE)
-                .edit().putLong("sync_last_ok", System.currentTimeMillis()).apply()
+        if (pendingRestores.isNotEmpty()) {
+            val confirmed = locals.filter { state.hashes[it.docId] == it.hash }.map { it.docId }.toSet()
+            check(prefs.edit().putStringSet("pending_restores", pendingRestores - confirmed).commit()) {
+                "恢复状态保存失败"
+            }
         }
+
+        // 3) 广播本地删除（pull 阶段没覆盖的：本地刚删、服务器还不知道）
+        val delIds = SyncLogic.planDeletes(locals.map { it.docId }.toSet(), state.hashes.keys)
+        val delOutcome = engine.delete(delIds.map { DeleteMark(DocKind.note, it, System.currentTimeMillis(), engine.deviceId) })
+        when (delOutcome) {
+            is SyncOutcome.Ok -> state = state.copy(hashes = state.hashes - delIds.toSet())
+            is SyncOutcome.Unreachable -> return Result.retry()
+            is SyncOutcome.Rejected -> return Result.failure()
+        }
+        graph.config.saveSyncState(state)
+        applicationContext.getSharedPreferences("config", Context.MODE_PRIVATE)
+            .edit().putLong("sync_last_ok", System.currentTimeMillis()).apply()
         return Result.success()
     }
 
@@ -148,7 +198,8 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     private fun localDocs(graph: AppGraph): List<SyncLogic.LocalDoc> =
         graph.notes.allFiles().mapNotNull { f ->
             val id = noteId(f) ?: return@mapNotNull null
-            val content = runCatching { graph.notes.readNote(f) }.getOrNull() ?: return@mapNotNull null
+            // Unreadable existing files must not be mistaken for local deletions.
+            val content = graph.notes.readNote(f)
             SyncLogic.LocalDoc(
                 docId = id, content = content,
                 category = f.parentFile?.let { p -> runCatching { p.relativeTo(graph.notes.root).path }.getOrNull() }.orEmpty(),
@@ -156,33 +207,44 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             )
         }
 
-    private fun localHashes(graph: AppGraph): Map<String, String> =
-        localDocs(graph).associate { it.docId to it.hash }
-
     private fun noteId(f: File): String? {
         val m = Regex("--([a-f0-9]{64})\\.md$").find(f.name) ?: return null
         return m.groupValues[1]
     }
 
-    private fun deleteLocalNote(graph: AppGraph, docId: String): Boolean =
-        graph.notes.allFiles().firstOrNull { noteId(it) == docId }?.let { it.delete() } ?: false
+    private fun deleteLocalNote(graph: AppGraph, docId: String): Boolean {
+        val oldFiles = graph.notes.allFiles().filter { noteId(it) == docId }
+        for (old in oldFiles) if (!old.delete()) throw java.io.IOException("无法删除本地笔记 ${old.name}")
+        if (oldFiles.isEmpty()) return false
+        return true
+    }
 
-    /** 写入远端下发的笔记；返回失败的 docId（调用方据此不推进光标，下次重拉） */
-    private fun applyWrites(graph: AppGraph, writes: List<SyncDoc>): List<String> {
-        val failed = mutableListOf<String>()
+    private fun categories(raw: String): List<String> = raw.split('/', '\\').filter { it.isNotBlank() }
+
+    private fun copyConflict(graph: AppGraph, d: SyncLogic.LocalDoc) {
+        val cats = categories(d.category).takeIf { parts ->
+            parts.size in 2..4 && parts.all { runCatching { com.willam.chatnotes.NoteFiles.segment(it, 60) }.isSuccess }
+        } ?: listOf("同步冲突", "待整理")
+        val id = sha256("sync-conflict\n${d.docId}\n${d.hash}")
+        com.willam.chatnotes.NoteFiles(File(graph.app.filesDir, "notes"))
+            .write(cats, "${d.title.ifBlank { "无标题" }}（冲突副本）", id, d.content)
+    }
+
+    /** Write the new file first, then remove the old path after success. */
+    private fun applyRemote(graph: AppGraph, d: SyncDoc) {
+        require(d.contentHash == sha256Hex16(d.content)) { "远端内容校验失败" }
+        val cats = categories(d.category)
         val files = com.willam.chatnotes.NoteFiles(File(graph.app.filesDir, "notes"))
-        for (d in writes) {
-            val cats = if (d.category.isBlank()) emptyList() else d.category.split('/', '\\').filter { it.isNotBlank() }
-            try {
-                // 远端改名/移动：同 ID 旧文件（旧标题/旧目录）先移除，否则 write 的拒覆盖语义会留下两份
-                graph.notes.allFiles().firstOrNull { noteId(it) == d.docId }?.delete()
-                files.write(cats, d.title, d.docId, d.content)
-            } catch (e: Exception) {
-                android.util.Log.w("ChatNotes", "sync: write failed ${d.docId}: ${e.message}")
-                failed.add(d.docId)
-            }
+        val oldFiles = graph.notes.allFiles().filter { noteId(it) == d.docId }
+        val target = File(cats.fold(graph.notes.root) { dir, part -> File(dir, com.willam.chatnotes.NoteFiles.segment(part, 60)) },
+            com.willam.chatnotes.NoteFiles.segment(d.title, 40) + "--${d.docId}.md")
+        if (oldFiles.any { it.canonicalFile == target.canonicalFile }) {
+            files.overwrite(cats, d.title, d.docId, d.content)
+        } else {
+            files.write(cats, d.title, d.docId, d.content)
         }
-        return failed
+        for (old in oldFiles) if (old.canonicalFile != target.canonicalFile && !old.delete())
+            throw java.io.IOException("新文件已写入，但旧文件删除失败：${old.name}")
     }
 
     private fun deviceId(context: Context): String {
@@ -194,19 +256,23 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
     }
 
     companion object {
+        private fun work() = OneTimeWorkRequestBuilder<SyncWorker>()
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
         /** 打开 app 时全量对账 */
         fun enqueueOnAppOpen(context: Context) {
             WorkManager.getInstance(context).enqueueUniqueWork(
-                "sync-open", ExistingWorkPolicy.KEEP,
-                OneTimeWorkRequestBuilder<SyncWorker>().build(),
+                "sync", ExistingWorkPolicy.KEEP,
+                work(),
             )
         }
 
         /** 笔记整理完成后增量同步 */
         fun enqueueAfterNoteChange(context: Context) {
             WorkManager.getInstance(context).enqueueUniqueWork(
-                "sync-change", ExistingWorkPolicy.APPEND_OR_REPLACE,
-                OneTimeWorkRequestBuilder<SyncWorker>().build(),
+                "sync", ExistingWorkPolicy.APPEND_OR_REPLACE,
+                work(),
             )
         }
     }

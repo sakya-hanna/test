@@ -1,5 +1,6 @@
 package com.willam.chatnotes
 
+import android.content.Context
 import com.willam.chatnotes.shared.sync.AppConfigDto
 import com.willam.chatnotes.shared.sync.AppConfigResponse
 import com.willam.chatnotes.shared.sync.AppConfigSaveRequest
@@ -12,14 +13,17 @@ import com.willam.chatnotes.shared.sync.PullRequest
 import com.willam.chatnotes.shared.sync.PullResponse
 import com.willam.chatnotes.shared.sync.PushRequest
 import com.willam.chatnotes.shared.sync.PushResponse
+import com.willam.chatnotes.shared.sync.PushResultItem
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import java.net.HttpURLConnection
 import java.net.URL
+import javax.net.ssl.HttpsURLConnection
 
 /** 同步结果：区分「服务不可达」与「被拒绝」，对应设计 §12.5 的提示要求 */
 sealed class SyncOutcome {
-    data class Ok(val nPush: Int, val nPulled: Int, val nDeleted: Int) : SyncOutcome()
+    data class Ok(val nPush: Int, val nPulled: Int, val nDeleted: Int,
+                  val results: List<PushResultItem> = emptyList()) : SyncOutcome()
     data class Unreachable(val cause: String) : SyncOutcome()
     data class Rejected(val httpCode: Int, val detail: String) : SyncOutcome()
 }
@@ -29,17 +33,25 @@ sealed class SyncOutcome {
  * HttpURLConnection 与 LlmClient 一致，不引入新网络依赖。
  */
 class SyncEngine(
+    private val context: Context,
     private val baseUrl: String,
     private val token: String,
     val deviceId: String,
 ) {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    init {
+        val uri = java.net.URI(baseUrl)
+        require(uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.userInfo == null &&
+            uri.query == null && uri.fragment == null) { "同步地址必须是有效 HTTPS 地址" }
+    }
 
     private fun <B, R> post(
         path: String, body: B, bodySer: KSerializer<B>, respSer: KSerializer<R>,
     ): Pair<Int, R?> {
-        val conn = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
+        val conn = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpsURLConnection
         try {
+            conn.sslSocketFactory = SyncTls.socketFactory(context)
+            conn.instanceFollowRedirects = false
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 20000
@@ -61,7 +73,7 @@ class SyncEngine(
         when {
             code == 401 || code == 403 -> SyncOutcome.Rejected(code, "token 被服务器拒绝")
             resp == null -> SyncOutcome.Rejected(code, "服务器响应无法解析 (HTTP $code)")
-            resp.protocolVersion != 1 -> SyncOutcome.Rejected(code, "服务器协议版本 ${resp.protocolVersion} 与端上不匹配")
+            resp.protocolVersion != 2 -> SyncOutcome.Rejected(code, "服务器协议版本 ${resp.protocolVersion} 与端上不匹配（需要 v2 服务端）")
             else -> SyncOutcome.Ok(0, 0, 0)
         }
     } catch (e: java.io.IOException) {
@@ -74,8 +86,11 @@ class SyncEngine(
             val (code, resp) = post("/v1/push", PushRequest(deviceId, docs), PushRequest.serializer(), PushResponse.serializer())
             when {
                 resp == null -> SyncOutcome.Rejected(code, "推送被拒绝 (HTTP $code)")
-                resp.results.any { it.status == "bad_hash" } -> SyncOutcome.Rejected(code, "有文档内容校验不符")
-                else -> SyncOutcome.Ok(docs.size, 0, 0)
+                resp.results.size != docs.size || resp.results.map { it.docId }.toSet() != docs.map { it.docId }.toSet() ->
+                    SyncOutcome.Rejected(code, "服务器推送确认与请求不一致")
+                resp.results.any { it.status !in setOf("new", "same") } ->
+                    SyncOutcome.Rejected(code, "服务器未接受全部文档：${resp.results.filter { it.status !in setOf("new", "same") }.map { it.docId to it.status }}")
+                else -> SyncOutcome.Ok(docs.size, 0, 0, resp.results)
             }
         } catch (e: java.io.IOException) {
             SyncOutcome.Unreachable(e.message ?: "网络错误")
@@ -94,7 +109,11 @@ class SyncEngine(
         if (marks.isEmpty()) return SyncOutcome.Ok(0, 0, 0)
         return try {
             val (code, resp) = post("/v1/delete", DeleteRequest(deviceId, marks), DeleteRequest.serializer(), DeleteResponse.serializer())
-            if (resp == null) SyncOutcome.Rejected(code, "删除广播被拒绝 (HTTP $code)") else SyncOutcome.Ok(0, 0, marks.size)
+            when {
+                resp == null -> SyncOutcome.Rejected(code, "删除广播被拒绝 (HTTP $code)")
+                resp.rejectedIds.isNotEmpty() -> SyncOutcome.Rejected(code, "服务端未接受删除：${resp.rejectedIds}")
+                else -> SyncOutcome.Ok(0, 0, marks.size)
+            }
         } catch (e: java.io.IOException) {
             SyncOutcome.Unreachable(e.message ?: "网络错误")
         }

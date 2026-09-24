@@ -25,6 +25,7 @@ class NoteAdmin(private val root: File, private val config: ConfigStore) {
         val dest = File(trashRoot, rel.path)
         dest.parentFile?.let { if (!it.isDirectory && !it.mkdirs()) throw java.io.IOException("无法创建回收站目录") }
         if (!meta.file.renameTo(dest)) throw java.io.IOException("移入回收站失败（文件被占用？）")
+        clearPendingRestore(meta.id)
         unpin(meta.id)
         NoteOps(root).cleanupEmptyDirsPublic(meta.file.parentFile)
         return meta.id
@@ -52,6 +53,8 @@ class NoteAdmin(private val root: File, private val config: ConfigStore) {
         dest.parentFile?.let { if (!it.isDirectory && !it.mkdirs()) throw java.io.IOException("无法恢复原目录") }
         require(!dest.exists()) { "原位置已有同名文件" }
         if (!cur.renameTo(dest)) throw java.io.IOException("恢复失败")
+        val pending = config.prefs.getStringSet("pending_restores", emptySet()).orEmpty().toSet() + meta.id
+        check(config.prefs.edit().putStringSet("pending_restores", pending).commit()) { "恢复状态保存失败" }
         NoteOps(root).cleanupEmptyDirsPublic(cur.parentFile)
         return dest
     }
@@ -61,6 +64,11 @@ class NoteAdmin(private val root: File, private val config: ConfigStore) {
         if (trashRoot.isDirectory) trashRoot.walkTopDown().filter { it.isFile }.forEach { if (it.delete()) n++ }
         trashRoot.delete()
         return n
+    }
+
+    private fun clearPendingRestore(id: String) {
+        val pending = config.prefs.getStringSet("pending_restores", emptySet()).orEmpty().toSet()
+        if (id in pending) config.prefs.edit().putStringSet("pending_restores", pending - id).commit()
     }
 
     // ---------- 收藏/置顶 ----------

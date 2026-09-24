@@ -3,8 +3,8 @@
 # 用法: bash gen-certs.sh <服务器IP或域名> [输出目录]
 # 产物:
 #   ca.crt / ca.key           自建 CA（ca.key 只存本地安全处，绝不放服务器）
-#   server.crt / server.key   服务器证书（放服务器，Ktor 直接用）
-#   ca.crt 需要拷到手机供 app 信任（network security config）
+#   server.p12                部署到服务器，Ktor 直接加载
+#   ca.crt                    复制到 app/src/main/res/raw/chatnotes_ca.pem 并重建 APK
 set -euo pipefail
 
 HOST="${1:?用法: gen-certs.sh <服务器IP或域名> [输出目录]}"

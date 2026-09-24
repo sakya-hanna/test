@@ -71,7 +71,9 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
             // Persist the validated response BEFORE writing the note, so disk failures do not repeat API calls.
             db.updateJob(id, "writing", draft = result.json())
             val warningText = snapshot.warnings.joinToString("；").ifBlank { "未发现已知采集缺口；仍建议核对原文" }
-            val source = "\n\n---\n\n## 来源与采集说明\n- 平台：ChatGPT\n- 会话 ID：${snapshot.id}\n" +
+            val platform = runCatching { Platform.match(android.net.Uri.parse(snapshot.url))?.label }.getOrNull()
+                ?: "未知平台"
+            val source = "\n\n---\n\n## 来源与采集说明\n- 平台：$platform\n- 会话 ID：${snapshot.id}\n" +
                 "- 原始会话：${snapshot.url.ifBlank { "本地会话，请在“已保存对话”中查看" }}\n" +
                 "- 本次快照：$id\n- 原文消息数：${snapshot.messages.size}\n- 采集说明：$warningText\n" +
                 "- 本笔记由模型整理，未经过事实核实；原文保存在本应用的会话记录中。\n"

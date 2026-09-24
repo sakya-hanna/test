@@ -3,7 +3,7 @@ package com.willam.chatnotes.shared.sync
 import kotlinx.serialization.Serializable
 
 /**
- * ChatNotes 同步协议 v1：形态 A（同步存储型）。
+ * ChatNotes 同步协议 v2：形态 A（同步存储型），删除响应逐条确认。
  * 端上为 source of truth 的写入方，服务器为同步中枢；笔记文件不可变（文件名含 jobId）。
  * 所有请求走 HTTPS + Bearer token；所有写操作以 (kind, docId) 为幂等键。
  */
@@ -90,6 +90,8 @@ data class DeleteRequest(
 @Serializable
 data class DeleteResponse(
     val serverCursor: Long,
+    /** IDs not deleted (for example a newer version exists); retry or resolve, never mark them synced. */
+    val rejectedIds: List<String> = emptyList(),
 )
 
 /** 健康检查/握手：端上验证 token 与服务器可达性 */

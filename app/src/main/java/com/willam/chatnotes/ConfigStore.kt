@@ -84,7 +84,18 @@ class ConfigStore(context: Context) {
     }
 
     @Synchronized fun saveSync(baseUrl: String, token: String) {
-        check(prefs.edit().putString("sync_base_url", baseUrl.trim()).putString("sync_token_encrypted", encrypted(token)).remove("sync_token").commit()) {
+        val base = baseUrl.trim().trimEnd('/')
+        if (base.isNotEmpty()) {
+            val uri = runCatching { URI(base) }.getOrNull()
+            require(uri != null && uri.scheme == "https" && !uri.host.isNullOrBlank() &&
+                uri.userInfo == null && uri.query == null && uri.fragment == null) { "同步地址必须是有效 HTTPS 地址" }
+        }
+        val editor = prefs.edit().putString("sync_base_url", base)
+            .putString("sync_token_encrypted", encrypted(token)).remove("sync_token")
+        if (base != (prefs.getString("sync_base_url", "") ?: "")) {
+            editor.remove("sync_state").remove("sync_cursor").remove("sync_last_ok")
+        }
+        check(editor.commit()) {
             "同步设置保存失败"
         }
     }
@@ -97,10 +108,10 @@ class ConfigStore(context: Context) {
     } catch (e: Exception) { SyncState() }
 
     fun saveSyncState(state: SyncState) {
-        prefs.edit()
+        check(prefs.edit()
             .putString("sync_state", Json.encodeToString(SyncState.serializer(), state))
             .putString("sync_cursor", state.cursor.toString())
-            .apply()
+            .commit()) { "同步进度保存失败" }
     }
 
     // ---- embedding service config (stage 2) ----

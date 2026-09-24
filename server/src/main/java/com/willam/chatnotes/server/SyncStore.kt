@@ -76,7 +76,7 @@ class SyncStore(dbUrl: String) : AutoCloseable {
         val existing = queryDoc(kind, docId)
         if (existing != null) {
             // 完全相同才算幂等命中；同内容但标题/分类不同 = 改名/移动，是合法更新（P1 起支持）
-            if (existing.contentHash == contentHash && existing.title == title && existing.category == category) return "same"
+            if (existing.deletedAt == 0L && existing.contentHash == contentHash && existing.title == title && existing.category == category) return "same"
             if (existing.updatedAt >= updatedAt) return "older"
         }
         // 方言分支：SQLite 用 INSERT OR REPLACE；PG 用 ON CONFLICT DO UPDATE
@@ -172,8 +172,9 @@ class SyncStore(dbUrl: String) : AutoCloseable {
 
     @Synchronized
     fun softDelete(kind: String, docId: String, deletedAt: Long): Boolean {
-        val updated = queryUpdatedAt(kind, docId) ?: return false
-        if (updated >= deletedAt) return false
+        val existing = queryDoc(kind, docId) ?: return false
+        if (existing.deletedAt > 0) return true // already tombstoned: idempotent acknowledgement
+        if (existing.updatedAt >= deletedAt) return false
         conn.prepareStatement("UPDATE docs SET deleted_at=?, updated_at=? WHERE kind=? AND doc_id=?").use { ps ->
             ps.setLong(1, deletedAt); ps.setLong(2, deletedAt)
             ps.setString(3, kind); ps.setString(4, docId)
@@ -299,16 +300,6 @@ class SyncStore(dbUrl: String) : AutoCloseable {
                     updatedAt = rs.getLong(2), deviceId = "", contentHash = rs.getString(1),
                     deletedAt = rs.getLong(3),
                 )
-            }
-        }
-    }
-
-    private fun queryUpdatedAt(kind: String, docId: String): Long? {
-        conn.prepareStatement("SELECT updated_at FROM docs WHERE kind=? AND doc_id=?").use { ps ->
-            ps.setString(1, kind); ps.setString(2, docId)
-            ps.executeQuery().use { rs ->
-                rs.next()
-                return rs.getLong(1)
             }
         }
     }

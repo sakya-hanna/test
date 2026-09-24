@@ -21,8 +21,10 @@ import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.auth.Authentication
 import io.ktor.server.auth.Principal
+import io.ktor.server.auth.UserIdPrincipal
 import io.ktor.server.auth.authenticate
 import io.ktor.server.auth.bearer
+import io.ktor.server.auth.basic
 import io.ktor.server.engine.applicationEngineEnvironment
 import io.ktor.server.engine.connector
 import io.ktor.server.engine.embeddedServer
@@ -39,7 +41,7 @@ import kotlinx.serialization.json.Json
 import java.io.File
 import java.security.MessageDigest
 
-const val PROTOCOL_VERSION = 1
+const val PROTOCOL_VERSION = 2
 
 fun sha256Hex16(content: String): String =
     MessageDigest.getInstance("SHA-256").digest(content.toByteArray(Charsets.UTF_8))
@@ -60,6 +62,10 @@ fun Application.syncModule(store: SyncStore, token: String, adminEnabled: Boolea
             realm = "chatnotes"
             authenticate { cred -> if (cred.token == token) TokenPrincipal else null }
         }
+        basic("admin") {
+            realm = "ChatNotes admin"
+            validate { cred -> if (cred.name == "admin" && cred.password == token) UserIdPrincipal(cred.name) else null }
+        }
     }
 
     suspend fun ApplicationCall.badRequest(msg: String) {
@@ -71,10 +77,9 @@ fun Application.syncModule(store: SyncStore, token: String, adminEnabled: Boolea
             call.respond(mapOf("ok" to true))
         }
 
-        // 极简管理页（只读）：文档列表 + 按标题/内容搜索。P1 最小实现，无 JS 无外部资源。
-        // 默认关闭（不注册路由→404）：/admin 无鉴权，公网部署前必须保持关闭；
-        // 补齐鉴权后可用 CHATNOTES_ADMIN=1 开启。
+        // Optional read-only admin page, guarded by HTTP Basic and TLS.
         if (adminEnabled) {
+            authenticate("admin") {
             get("/admin") {
             val q = call.request.queryParameters["q"].orEmpty().trim()
             val docs = store.listDocs(q, limit = 200)
@@ -114,6 +119,7 @@ input{padding:6px;width:60%}button{padding:6px 14px}.m{color:#888;font-size:12px
                 call.respondText(html, io.ktor.http.ContentType.Text.Html)
             }
         }
+            }
         }
 
         authenticate("chatnotes") {
@@ -134,7 +140,7 @@ input{padding:6px;width:60%}button{padding:6px 14px}.m{color:#888;font-size:12px
                 store.touchDevice(req.deviceId, System.currentTimeMillis())
                 call.respond(
                     HelloResponse(
-                        serverVersion = "0.1.0",
+                        serverVersion = "0.2.0",
                         protocolVersion = PROTOCOL_VERSION,
                         docCount = store.docCount(),
                         serverTime = System.currentTimeMillis(),
@@ -191,11 +197,10 @@ input{padding:6px;width:60%}button{padding:6px 14px}.m{color:#888;font-size:12px
 
             post("/v1/delete") {
                 val req = call.receive<DeleteRequest>()
-                req.deletes.forEach { m ->
-                    store.softDelete(m.kind.name, m.docId, m.deletedAt)
-                }
+                val rejected = req.deletes.filter { m -> !store.softDelete(m.kind.name, m.docId, m.deletedAt) }
+                    .map { it.docId }
                 store.touchDevice(req.deviceId, System.currentTimeMillis())
-                call.respond(DeleteResponse(serverCursor = store.currentSeq()))
+                call.respond(DeleteResponse(serverCursor = store.currentSeq(), rejectedIds = rejected))
             }
         }
     }
@@ -210,7 +215,7 @@ fun main() {
         ?: error("CHATNOTES_TOKEN env or token.txt required")
     val ksPath = System.getenv("CHATNOTES_KEYSTORE")
     val ksPass = System.getenv("CHATNOTES_KEYSTORE_PASSWORD") ?: "chatnotes"
-    // /admin 只读管理页默认关闭（无鉴权，公网暴露风险）；显式 CHATNOTES_ADMIN=1 才开放
+    // /admin defaults off; when enabled it requires Basic admin / sync token.
     val adminEnabled = System.getenv("CHATNOTES_ADMIN") == "1"
 
     val server = embeddedServer(Netty, environment = applicationEngineEnvironment {
@@ -225,8 +230,8 @@ fun main() {
                 this.host = "0.0.0.0"; this.port = port
             }
         } else {
-            // 开发/本机调试：无证书时退回明文（app 端 usesCleartextTraffic=false 会拒绝，仅限 curl/联调）
-            connector { this.host = "0.0.0.0"; this.port = port }
+            // No certificate: plain HTTP is restricted to this machine only.
+            connector { this.host = "127.0.0.1"; this.port = port }
         }
     })
     server.start(wait = true)

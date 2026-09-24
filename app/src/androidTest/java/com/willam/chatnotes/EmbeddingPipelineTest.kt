@@ -84,9 +84,25 @@ class EmbeddingPipelineTest {
         val hits = index.hybridQuery("白屏 修复", api)
         assertTrue(hits.isNotEmpty())
         assertTrue(hits.any { it.title == "白屏问题" })
+        assertEquals(1, hits.count { it.title == "白屏问题" }) // one document, two ranking signals
         // Semantic-only hit surfaces with document data filled in.
         val semOnly = index.hybridQuery("渲染 进程 重建", api)
         assertTrue(semOnly.isNotEmpty())
+    }
+
+    @Test fun editAndDeleteInvalidateStoredVectors() {
+        val api = FakeEmbed()
+        index.ensureEmbedded(notes, chat, api)
+        val file = notes.allFiles().first { it.name.contains("白屏问题") }
+        file.writeText("已编辑为完全不同的内容 新词词词词词词")
+        index.ensureIndexed(notes, chat)
+        assertEquals(1, index.embedStatus(api.modelId).chunks)
+        assertEquals(1, index.embedStatus(api.modelId).pending)
+        index.ensureEmbedded(notes, chat, api)
+        assertEquals(2, index.embedStatus(api.modelId).chunks)
+        file.delete()
+        index.ensureIndexed(notes, chat)
+        assertEquals(1, index.embedStatus(api.modelId).chunks)
     }
 
     @Test fun hybridDegradesToKeywordWithoutApi() {
